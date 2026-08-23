@@ -293,13 +293,17 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			w.WriteHeader(resp.StatusCode)
 			var usage bridgeUsage
 			var usageReported bool
+			obs := newStreamEndObserver(resp.Body)
 			if external == route.Protocol {
 				observer := newStreamUsageObserver(route.Protocol)
-				_, err = io.Copy(w, io.TeeReader(resp.Body, observer))
+				_, copyErr := io.Copy(w, io.TeeReader(obs, observer))
 				usage = observer.Finish()
 				usageReported = observer.Reported()
+				g.logStreamEnd(ids, model, route, external, obs, copyErr)
+				err = copyErr
 			} else {
-				usage, usageReported, err = transcodeStreamWithUsage(w, resp.Body, route.Protocol, external, model)
+				usage, usageReported, err = transcodeStreamWithUsage(w, obs, route.Protocol, external, model)
+				g.logStreamEnd(ids, model, route, external, obs, err)
 			}
 			if meta != nil {
 				meta.Usage, meta.UsageReported = usage, usageReported
