@@ -1,12 +1,7 @@
 package main
 
-// ponytail: P0+P1 observability for mid-stream truncation diagnosis.
-// Logs one INFO line per upstream stream end: outcome (upstream_clean /
-// upstream_broken / client_write_error), bytes delivered, max inter-chunk gap,
-// total duration, and completion status (completed vs premature_close).
-// The completion field distinguishes "upstream sentfinish_reason"
-// from "clean TCP close without terminal marker" — the latter is upstream
-// silently abandoning generation mid-stream.
+// P0 observability for streamed upstream responses. This file deliberately
+// does not retry or continue a response after any bytes reach the client.
 
 import (
 	"context"
@@ -17,26 +12,33 @@ import (
 )
 
 type streamEndObserver struct {
-	reader       io.Reader
-	started      time.Time
-	lastRead     time.Time
-	maxGap       time.Duration
-	bytes        int64
-	readErr      error // first non-EOF error returned by the upstream body read side
-	hasContent   bool   // saw at least one non-empty content/reasoning/tool delta
-	sawTerminal  bool   // finish_reason
-	protocol     Protocol
-	sseBuffer    []byte
-	parser       *bridgeStreamParser
+	reader         io.Reader
+	started        time.Time
+	lastRead       time.Time
+	maxGap         time.Duration
+	bytes          int64
+	chunks         int64
+	readErr        error
+	hasContent     bool
+	sawTerminal    bool
+	terminalMarker string
+	reasoningBytes int64
+	visibleBytes   int64
+	toolBytes      int64
+	sseFrames      int64
+	parseErrors    int64
+	lastEventName  string
+	lastEventKind  string
+	sseBuffer      []byte
+	parser         *bridgeStreamParser
 }
 
 func newStreamEndObserver(reader io.Reader, protocol Protocol) *streamEndObserver {
 	now := time.Now()
 	return &streamEndObserver{
-		reader:    reader,
-		started:    now,
-		lastRead:   now,
-		protocol:   protocol,
+		reader:   reader,
+		started:  now,
+		lastRead: now,
 		parser: &bridgeStreamParser{
 			protocol:          protocol,
 			tools:             map[string]bool{},
@@ -57,6 +59,7 @@ func (s *streamEndObserver) Read(p []byte) (int, error) {
 		}
 		s.lastRead = now
 		s.bytes += int64(n)
+		s.chunks++
 		s.scan(p[:n])
 	}
 	if err != nil && err != io.EOF && s.readErr == nil {
@@ -65,9 +68,6 @@ func (s *streamEndObserver) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// scan feeds raw bytes through a minimal SSE frame parser, tracking whether
-// any meaningful content (text, reasoning, tool call) or terminal marker
-// ([DONE], finish_reason) has been observed.
 func (s *streamEndObserver) scan(data []byte) {
 	s.sseBuffer = append(s.sseBuffer, data...)
 	for {
@@ -82,36 +82,67 @@ func (s *streamEndObserver) scan(data []byte) {
 }
 
 func (s *streamEndObserver) consumeFrame(frame []byte) {
+	s.sseFrames++
 	_ = readSSE(strings.NewReader(string(frame)), func(eventName, data string) error {
+		s.lastEventName = eventName
 		events, err := s.parser.Parse(eventName, data)
 		if err != nil {
+			s.parseErrors++
+			s.lastEventKind = "parse_error"
 			return nil
 		}
 		for _, event := range events {
+			s.lastEventKind = event.Kind
 			switch event.Kind {
-			case "text", "reasoning", "tool_delta":
+			case "reasoning":
 				if event.Text != "" {
 					s.hasContent = true
+					s.reasoningBytes += int64(len(event.Text))
 				}
+			case "text":
+				if event.Text != "" {
+					s.hasContent = true
+					s.visibleBytes += int64(len(event.Text))
+				}
+			case "tool_start":
+				s.hasContent = true
+			case "tool_delta":
+				s.hasContent = true
+				s.toolBytes += int64(len(event.Text))
 			case "done":
 				s.sawTerminal = true
+				s.terminalMarker = "done"
 			case "finish":
 				s.sawTerminal = true
+				s.terminalMarker = "finish"
+				if event.Stop != "" {
+					s.terminalMarker += ":" + event.Stop
+				}
 			}
 		}
 		return nil
 	})
 }
 
-// finish processes any remaining buffered bytes (called after stream ends).
 func (s *streamEndObserver) finish() {
-	if len(s.sseBuffer) > 0 {
-		s.consumeFrame(s.sseBuffer)
-		s.sseBuffer = nil
+	if len(s.sseBuffer) == 0 {
+		return
 	}
+	s.consumeFrame(s.sseBuffer)
+	s.sseBuffer = nil
 }
 
-func (g *Gateway) logStreamEnd(ids requestIDs, model string, route modelRoute, external Protocol, obs *streamEndObserver, copyErr error) {
+func (g *Gateway) logStreamEnd(
+	ids requestIDs,
+	model string,
+	route modelRoute,
+	external Protocol,
+	obs *streamEndObserver,
+	copyErr error,
+	attempts int,
+	clientCtx context.Context,
+	requestCtx context.Context,
+) {
 	if g == nil || g.logger == nil || obs == nil {
 		return
 	}
@@ -125,16 +156,8 @@ func (g *Gateway) logStreamEnd(ids requestIDs, model string, route modelRoute, e
 		outcome = "client_write_error"
 	}
 
-	// completion: did the upstream send a proper terminal marker?
-	completion := "completed"
-	if !obs.sawTerminal {
-		if obs.hasContent {
-			completion = "premature_close"
-		} else {
-			completion = "empty_response"
-		}
-	}
-
+	termination := streamTermination(obs, copyErr)
+	completion := streamCompletion(obs)
 	attrs := []any{
 		"request_id", ids.Request,
 		"model", model,
@@ -143,12 +166,34 @@ func (g *Gateway) logStreamEnd(ids requestIDs, model string, route modelRoute, e
 		"external_protocol", string(external),
 		"outcome", outcome,
 		"completion", completion,
+		"termination", termination,
+		"attempts", attempts,
+		"has_content", obs.hasContent,
+		"terminal_seen", obs.sawTerminal,
+		"terminal_marker", obs.terminalMarker,
+		"last_sse_event", obs.lastEventName,
+		"last_event_kind", obs.lastEventKind,
+		"reasoning_bytes", obs.reasoningBytes,
+		"visible_bytes", obs.visibleBytes,
+		"tool_bytes", obs.toolBytes,
+		"chunks", obs.chunks,
+		"sse_frames", obs.sseFrames,
+		"parse_errors", obs.parseErrors,
 		"bytes", obs.bytes,
 		"max_gap_ms", obs.maxGap.Milliseconds(),
 		"duration_ms", time.Since(obs.started).Milliseconds(),
 	}
 	if obs.readErr != nil {
-		attrs = append(attrs, "read_error", obs.readErr.Error())
+		attrs = append(attrs, "read_error", obs.readErr.Error(), "read_error_class", streamErrorClass(obs.readErr))
+	}
+	if copyErr != nil {
+		attrs = append(attrs, "copy_error", copyErr.Error(), "copy_error_class", streamErrorClass(copyErr))
+	}
+	if err := contextError(clientCtx); err != nil {
+		attrs = append(attrs, "client_context_error", err.Error(), "client_context_error_class", streamErrorClass(err))
+	}
+	if err := contextError(requestCtx); err != nil {
+		attrs = append(attrs, "request_context_error", err.Error(), "request_context_error_class", streamErrorClass(err))
 	}
 	g.logger.Log(context.Background(), slog.LevelInfo, "upstream stream ended", attrs...)
 }
