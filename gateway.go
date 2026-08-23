@@ -273,10 +273,11 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			writeAPIError(w, external, http.StatusBadGateway, "all upstream attempts failed", "upstream_error", ids.Request)
 			return
 		}
-		defer resp.Body.Close()
+		// resp.Body is managed by the stream retry loop or the non-stream path below.
 		w.Header().Set("x-request-id", ids.Request)
 		if resp.StatusCode/100 != 2 {
 			copyErrorResponse(w, external, resp, ids.Request)
+			drainAndClose(resp.Body)
 			return
 		}
 		if stream {
@@ -287,13 +288,52 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 				g.monitor.activeStreams.Add(1)
 				defer g.monitor.activeStreams.Add(-1)
 			}
+
+			// ponytail: empty-response retry — buffer upstream SSE, detect empty
+			// or premature-close responses before delivering anything to the
+			// client. If upstream returned 200 but no meaningful content (a
+			// known Zen behavior where generation is silently abandoned),
+			// transparently retry on the next exit. Budget: 2 retries (3 total).
+			// Ceiling: once any content byte is delivered to the client, retry
+			// is impossible (would duplicate). Upgrade path: per-key budget.
+			const maxEmptyRetries = 2
+			var bufferedBytes []byte
+			for emptyRetry := 0; ; emptyRetry++ {
+				probeResult := probeStreamContent(resp.Body, route.Protocol, &bufferedBytes, 64<<10)
+				if probeResult == probeContentFound || emptyRetry >= maxEmptyRetries {
+					break
+				}
+				// Empty or premature close — retry
+				g.logger.Info("empty upstream response; retrying on next exit",
+					"component", "upstream", "event", "empty_response_retry",
+					"request_id", ids.Request, "model", model, "retry", emptyRetry+1,
+					"probe", probeResult.String(),
+					"buffered_bytes", len(bufferedBytes))
+				drainAndClose(resp.Body)
+				bufferedBytes = bufferedBytes[:0]
+				resp, err = g.doUpstream(requestCtx, route, encoded, ids)
+				if err != nil {
+					g.logger.Warn("retry upstream failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "error", err)
+					writeAPIError(w, external, http.StatusBadGateway, "all upstream attempts failed", "upstream_error", ids.Request)
+					return
+				}
+				if resp.StatusCode/100 != 2 {
+					copyErrorResponse(w, external, resp, ids.Request)
+					drainAndClose(resp.Body)
+					return
+				}
+			}
+			defer resp.Body.Close()
+
+			// Replay buffered bytes + remaining body.
+			replayBody := io.MultiReader(bytes.NewReader(bufferedBytes), resp.Body)
 			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 			w.Header().Set("Cache-Control", "no-cache")
 			w.Header().Set("X-Accel-Buffering", "no")
 			w.WriteHeader(resp.StatusCode)
 			var usage bridgeUsage
 			var usageReported bool
-			obs := newStreamEndObserver(resp.Body)
+			obs := newStreamEndObserver(replayBody, route.Protocol)
 			if external == route.Protocol {
 				observer := newStreamUsageObserver(route.Protocol)
 				_, copyErr := io.Copy(w, io.TeeReader(obs, observer))
@@ -314,6 +354,7 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			return
 		}
 		responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+		drainAndClose(resp.Body)
 		if err != nil {
 			writeAPIError(w, external, http.StatusBadGateway, "failed to read upstream response", "upstream_error", ids.Request)
 			return
