@@ -290,13 +290,12 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			}
 
 			// ponytail: empty-response retry — buffer upstream SSE, detect empty
-			// or premature-close responses before delivering anything to the
-			// client. If upstream returned 200 but no meaningful content (a
-			// known Zen behavior where generation is silently abandoned),
-			// transparently retry on the next exit. Budget: 2 retries (3 total).
-			// Ceiling: once any content byte is delivered to the client, retry
-			// is impossible (would duplicate). Upgrade path: per-key budget.
-			const maxEmptyRetries = 2
+			// responses before delivering to the client. If upstream returned 200
+			// but no meaningful content (a known Zen behavior where generation is
+			// silently abandoned), retry ONCE on the next exit. If still empty,
+			// deliver immediately — don't multiply the user's wait time when the
+			// upstream is systematically returning empties (per-IP/model quota).
+			const maxEmptyRetries = 1
 			var bufferedBytes []byte
 			for emptyRetry := 0; ; emptyRetry++ {
 				probeResult := probeStreamContent(resp.Body, route.Protocol, &bufferedBytes, 64<<10)
