@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1106,4 +1107,192 @@ func mergeBridgeUsage(destination *bridgeUsage, source bridgeUsage) {
 		destination.Reasoning = source.Reasoning
 	}
 	destination.Total = max(destination.Total, destination.Input+destination.Output)
+}
+
+// streamEndObserver wraps an io.Reader to collect stream end observability.
+// It does not retry or continue a response after any bytes reach the client.
+type streamEndObserver struct {
+	reader         io.Reader
+	started        time.Time
+	lastRead       time.Time
+	maxGap         time.Duration
+	bytes          int64
+	chunks         int64
+	readErr        error
+	hasContent     bool
+	sawTerminal    bool
+	terminalMarker string
+	reasoningBytes int64
+	visibleBytes   int64
+	toolBytes      int64
+	sseFrames      int64
+	parseErrors    int64
+	lastEventName  string
+	lastEventKind  string
+	sseBuffer      []byte
+	parser         *bridgeStreamParser
+}
+
+func newStreamEndObserver(reader io.Reader, protocol Protocol) *streamEndObserver {
+	now := time.Now()
+	return &streamEndObserver{
+		reader:   reader,
+		started:  now,
+		lastRead: now,
+		parser: &bridgeStreamParser{
+			protocol:          protocol,
+			tools:             map[string]bool{},
+			toolIDs:           map[string]string{},
+			toolNames:         map[string]string{},
+			responseArgs:      map[string]bool{},
+			responseReasoning: map[string]bool{},
+		},
+	}
+}
+
+func (s *streamEndObserver) Read(p []byte) (int, error) {
+	n, err := s.reader.Read(p)
+	if n > 0 {
+		now := time.Now()
+		if gap := now.Sub(s.lastRead); gap > s.maxGap {
+			s.maxGap = gap
+		}
+		s.lastRead = now
+		s.bytes += int64(n)
+		s.chunks++
+		s.scan(p[:n])
+	}
+	if err != nil && err != io.EOF && s.readErr == nil {
+		s.readErr = err
+	}
+	return n, err
+}
+
+func (s *streamEndObserver) scan(data []byte) {
+	s.sseBuffer = append(s.sseBuffer, data...)
+	for {
+		index, width := nextSSEBoundary(s.sseBuffer)
+		if index < 0 {
+			break
+		}
+		frame := append([]byte(nil), s.sseBuffer[:index+width]...)
+		s.sseBuffer = s.sseBuffer[index+width:]
+		s.consumeFrame(frame)
+	}
+}
+
+func (s *streamEndObserver) consumeFrame(frame []byte) {
+	s.sseFrames++
+	_ = readSSE(strings.NewReader(string(frame)), func(eventName, data string) error {
+		s.lastEventName = eventName
+		events, err := s.parser.Parse(eventName, data)
+		if err != nil {
+			s.parseErrors++
+			s.lastEventKind = "parse_error"
+			return nil
+		}
+		for _, event := range events {
+			s.lastEventKind = event.Kind
+			switch event.Kind {
+			case "reasoning":
+				if event.Text != "" {
+					s.hasContent = true
+					s.reasoningBytes += int64(len(event.Text))
+				}
+			case "text":
+				if event.Text != "" {
+					s.hasContent = true
+					s.visibleBytes += int64(len(event.Text))
+				}
+			case "tool_start":
+				s.hasContent = true
+			case "tool_delta":
+				s.hasContent = true
+				s.toolBytes += int64(len(event.Text))
+			case "done":
+				s.sawTerminal = true
+				s.terminalMarker = "done"
+			case "finish":
+				s.sawTerminal = true
+				s.terminalMarker = "finish"
+				if event.Stop != "" {
+					s.terminalMarker += ":" + event.Stop
+				}
+			}
+		}
+		return nil
+	})
+}
+
+func (s *streamEndObserver) finish() {
+	if len(s.sseBuffer) == 0 {
+		return
+	}
+	s.consumeFrame(s.sseBuffer)
+	s.sseBuffer = nil
+}
+
+// Classification helpers for stream termination.
+
+func streamErrorClass(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return "unexpected_eof"
+	case errors.Is(err, context.Canceled):
+		return "context_canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline_exceeded"
+	default:
+		return "other"
+	}
+}
+
+func contextError(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	return ctx.Err()
+}
+
+func streamTermination(obs *streamEndObserver, copyErr error) string {
+	if obs != nil && obs.readErr != nil {
+		switch {
+		case errors.Is(obs.readErr, io.ErrUnexpectedEOF):
+			return "upstream_unexpected_eof"
+		case errors.Is(obs.readErr, context.Canceled):
+			return "read_context_canceled"
+		case errors.Is(obs.readErr, context.DeadlineExceeded):
+			return "upstream_deadline_exceeded"
+		default:
+			return "upstream_read_error"
+		}
+	}
+	if copyErr != nil {
+		if errors.Is(copyErr, context.Canceled) {
+			return "downstream_context_canceled"
+		}
+		return "downstream_write_error"
+	}
+	if obs != nil && obs.sawTerminal {
+		return "completed"
+	}
+	if obs != nil && obs.hasContent {
+		return "clean_without_terminal"
+	}
+	return "empty_without_terminal"
+}
+
+func streamCompletion(obs *streamEndObserver) string {
+	if obs == nil || obs.sawTerminal {
+		return "completed"
+	}
+	if obs.hasContent {
+		return "premature_close"
+	}
+	return "empty_response"
 }

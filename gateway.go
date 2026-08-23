@@ -934,6 +934,72 @@ func writeJSONStatus(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+func (g *Gateway) logStreamEnd(
+	ids requestIDs,
+	model string,
+	route modelRoute,
+	external Protocol,
+	obs *streamEndObserver,
+	copyErr error,
+	attempts int,
+	clientCtx context.Context,
+	requestCtx context.Context,
+) {
+	if g == nil || g.logger == nil || obs == nil {
+		return
+	}
+	obs.finish()
+
+	outcome := "upstream_clean"
+	switch {
+	case obs.readErr != nil:
+		outcome = "upstream_broken"
+	case copyErr != nil:
+		outcome = "client_write_error"
+	}
+
+	termination := streamTermination(obs, copyErr)
+	completion := streamCompletion(obs)
+	attrs := []any{
+		"request_id", ids.Request,
+		"model", model,
+		"tier", string(route.Tier),
+		"native_protocol", string(route.Protocol),
+		"external_protocol", string(external),
+		"outcome", outcome,
+		"completion", completion,
+		"termination", termination,
+		"attempts", attempts,
+		"has_content", obs.hasContent,
+		"terminal_seen", obs.sawTerminal,
+		"terminal_marker", obs.terminalMarker,
+		"last_sse_event", obs.lastEventName,
+		"last_event_kind", obs.lastEventKind,
+		"reasoning_bytes", obs.reasoningBytes,
+		"visible_bytes", obs.visibleBytes,
+		"tool_bytes", obs.toolBytes,
+		"chunks", obs.chunks,
+		"sse_frames", obs.sseFrames,
+		"parse_errors", obs.parseErrors,
+		"bytes", obs.bytes,
+		"max_gap_ms", obs.maxGap.Milliseconds(),
+		"duration_ms", time.Since(obs.started).Milliseconds(),
+	}
+	if obs.readErr != nil {
+		attrs = append(attrs, "read_error", obs.readErr.Error(), "read_error_class", streamErrorClass(obs.readErr))
+	}
+	if copyErr != nil {
+		attrs = append(attrs, "copy_error", copyErr.Error(), "copy_error_class", streamErrorClass(copyErr))
+	}
+	if err := contextError(clientCtx); err != nil {
+		attrs = append(attrs, "client_context_error", err.Error(), "client_context_error_class", streamErrorClass(err))
+	}
+	if err := contextError(requestCtx); err != nil {
+		attrs = append(attrs, "request_context_error", err.Error(), "request_context_error_class", streamErrorClass(err))
+	}
+	g.logger.Log(context.Background(), slog.LevelInfo, "upstream stream ended", attrs...)
+}
+
 func recoveryMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
