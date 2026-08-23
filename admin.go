@@ -105,6 +105,8 @@ func (a *AdminServer) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -151,7 +153,7 @@ func (a *AdminServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	a.sessions[tokenDigest(token)] = adminSession{Username: cfg.WebUI.Username, AuthVersion: secretFingerprint(cfg.WebUI.PasswordHash), CSRF: csrf, Expires: expires}
 	a.mu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: adminCookieName, Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, Expires: expires, MaxAge: int(time.Until(expires).Seconds()), Secure: false})
+	http.SetCookie(w, &http.Cookie{Name: adminCookieName, Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, Expires: expires, MaxAge: int(time.Until(expires).Seconds()), Secure: requestIsSecure(r)})
 	w.Header().Set("Cache-Control", "no-store")
 	a.logger.Info("admin login succeeded", "component", "auth", "event", "login_succeeded", "client_ip", client)
 	writeJSON(w, http.StatusOK, map[string]any{"username": cfg.WebUI.Username, "csrf_token": csrf, "expires_at": expires.UTC()})
@@ -170,7 +172,7 @@ func (a *AdminServer) handleLogout(w http.ResponseWriter, r *http.Request) {
 		delete(a.sessions, tokenDigest(cookie.Value))
 		a.mu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{Name: adminCookieName, Value: "", Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: -1})
+	http.SetCookie(w, &http.Cookie{Name: adminCookieName, Value: "", Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: -1, Secure: requestIsSecure(r)})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -219,7 +221,11 @@ func (a *AdminServer) csrf(next http.Handler) http.Handler {
 		}
 		if origin := r.Header.Get("Origin"); origin != "" {
 			parsed, err := url.Parse(origin)
-			if err != nil || !strings.EqualFold(parsed.Host, r.Host) {
+			expectedScheme := "http"
+			if requestIsSecure(r) {
+				expectedScheme = "https"
+			}
+			if err != nil || !strings.EqualFold(parsed.Host, r.Host) || !strings.EqualFold(parsed.Scheme, expectedScheme) {
 				writeAdminError(w, http.StatusForbidden, "origin_failed", "request origin does not match this server")
 				return
 			}
@@ -388,7 +394,7 @@ func (a *AdminServer) handleAccount(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	a.sessions = make(map[string]adminSession)
 	a.mu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: adminCookieName, Value: "", Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: -1})
+	http.SetCookie(w, &http.Cookie{Name: adminCookieName, Value: "", Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: -1, Secure: requestIsSecure(r)})
 	a.logger.Info("admin account updated", "component", "auth", "event", "account_updated", "client_ip", clientIP(r))
 	writeJSON(w, http.StatusOK, map[string]any{"updated": true, "reauthenticate": true})
 }
@@ -528,7 +534,7 @@ func sanitizeDebugValue(value any, redactor *SecretRedactor) any {
 		result := make(map[string]any, len(current))
 		for key, item := range current {
 			lower := strings.ToLower(key)
-			if strings.Contains(lower, "authorization") || strings.Contains(lower, "cookie") || strings.Contains(lower, "password") || strings.Contains(lower, "secret") || strings.Contains(lower, "api_key") || strings.Contains(lower, "api-key") {
+			if sensitiveDebugKey(lower) {
 				result[key] = "***"
 				continue
 			}
@@ -774,6 +780,25 @@ func clientIP(r *http.Request) string {
 		return host
 	}
 	return r.RemoteAddr
+}
+
+func requestIsSecure(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	return r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
+}
+
+func sensitiveDebugKey(key string) bool {
+	for _, hint := range []string{
+		"authorization", "cookie", "password", "secret", "api_key", "api-key", "x-api-key",
+		"access_token", "refresh_token", "set-cookie", "credential",
+	} {
+		if strings.Contains(key, hint) {
+			return true
+		}
+	}
+	return false
 }
 
 func decodeAdminJSON(w http.ResponseWriter, r *http.Request, target any) error {

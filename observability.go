@@ -89,11 +89,11 @@ func (h *LogHub) Publish(event LogEvent) {
 }
 
 func (h *LogHub) Recent(after uint64, limit int) ([]LogEvent, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
 	if limit < 1 || limit > len(h.buffer) {
 		limit = len(h.buffer)
 	}
-	h.mu.RLock()
-	defer h.mu.RUnlock()
 	oldest := uint64(0)
 	if h.count > 0 {
 		oldest = h.buffer[h.start].Sequence

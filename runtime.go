@@ -290,9 +290,6 @@ func (m *RuntimeManager) DebugModels() ([]ModelRouteDiagnostic, MetadataSnapshot
 	models := gateway.catalog.List()
 	result := make([]ModelRouteDiagnostic, 0, len(models))
 	for _, model := range models {
-		if !supportedModel(model) {
-			continue
-		}
 		result = append(result, gateway.catalog.Diagnostic(model, "", len(gateway.cfg.ZenKeys) > 0, len(gateway.cfg.GoKeys) > 0, gateway.cfg.Anonymous))
 	}
 	metadata := MetadataSnapshot{}

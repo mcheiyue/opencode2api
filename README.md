@@ -10,6 +10,7 @@
 - 支持文本、图片、thinking/reasoning、工具定义、工具调用和工具结果转换
 - 分离配置 Zen key 池与 Zen Go key 池
 - 支持无需上游 key 的 Zen 匿名模式，免费模型先走匿名通道，失败后按 `prefer` 顺序回退 Zen/Go key
+- 按配置周期同步 Zen/Go `/v1/models`，并从 OpenCode `models.opencode.ai/api.json` 自动同步每个 Tier 的原生协议与不支持模型；不把模型 ID 硬编码在程序中
 - 每 24 小时从 models.dev 更新 OpenCode 成本与弃用信息；models.dev 零成本或名称含 `free` 任一条件即可判定免费
 - 模型同时存在于两个上游时按 `prefer` 配置排列 Go/Zen key 的首选与回退顺序（默认 Go）
 - 支持直连、HTTP、HTTPS、SOCKS5 和 SOCKS5H 代理
@@ -69,7 +70,7 @@ Token 页面展示用量覆盖率、每分钟趋势、模型排行与 Zen/Go Tie
 | `upstream` | 上游尝试的 `lifetime`、`last_hour` 与 `recent`。按 Tier、匿名/Key 通道、Key 指纹聚合。 |
 | `resources` | 模型目录、Key 冷却、脱敏代理节点、匿名开关和 models.dev metadata 状态。 |
 
-`usage.*.tokens` 与模型/Tier 项均包含 `input_tokens`、`output_tokens`、`cached_tokens`、`reasoning_tokens`、`total_tokens`。`metrics.series` 的每分钟点也包含这些 Token 字段和 `usage_reported`。普通 JSON、同协议 SSE 与跨协议 SSE 响应都会解析上游 usage；`coverage` 是收到 usage 的推理请求数除以已建立上游路由的推理请求数。上游未提供 usage 时不会估算 Token。
+`usage.*.tokens` 与模型/Tier 项均包含 `input_tokens`、`output_tokens`、`cached_tokens`、`reasoning_tokens`、`total_tokens`。其中 `input_tokens` 统一表示包含缓存读写的总输入，`cached_tokens` 单独表示缓存读取量。`metrics.series` 的每分钟点也包含这些 Token 字段和 `usage_reported`。普通 JSON、同协议 SSE 与跨协议 SSE 响应都会解析上游 usage；`coverage` 是收到 usage 的推理请求数除以已建立上游路由的推理请求数。上游未提供 usage 时不会估算 Token。
 
 每个 `upstream.recent` 项包含时间、Request ID、模型、Tier、尝试序号、匿名标记、通道、Key 指纹、`proxy_node`、HTTP 状态、耗时、成功标记和结果分类。匿名请求的 Key ID 固定显示为 `anonymous`；真实 Key 只显示 SHA-256 稳定短指纹。代理 URL 的认证信息会被移除，字段名称明确为代理节点而非出口 IP。
 
@@ -305,8 +306,8 @@ socks5://127.0.0.1:1080  # 备用代理
 
 | 字段 | 含义 |
 | --- | --- |
-| `models.refresh_seconds` | 重新读取 Zen 和 Go 模型列表的间隔秒数。两个列表会并发刷新。 |
-| `models.protocols` | 手动指定模型的原生协议。值只能是 `chat`、`responses` 或 `anthropic`。通常保持为空。 |
+| `models.refresh_seconds` | 重新读取 Zen 和 Go 模型列表及 OpenCode 能力目录的间隔秒数。两个模型列表与能力目录会并发刷新。 |
+| `models.protocols` | 手动指定模型的原生协议。值只能是 `chat`、`responses` 或 `anthropic`，并覆盖自动同步结果。通常保持为空。 |
 
 
 模型协议覆盖示例：
@@ -317,6 +318,8 @@ socks5://127.0.0.1:1080  # 备用代理
 }
 ```
 
+自动协议来源是 `https://models.opencode.ai/api.json`，并用 OpenCode 官方 Zen/Go endpoint 文档补充具体路径：模型的 `provider.npm`（或 Tier 默认 `npm`）及文档 endpoint 会映射为 OpenAI Responses、Anthropic Messages 或 OpenAI-compatible Chat。若能力目录暂时无法更新，服务会保留进程内上一份能力快照；首次启动且没有能力快照时，不会暴露能力未知的模型，避免把不支持的模型误路由到 Chat。手动 `models.protocols` 可用于上游实验模型。
+
 模型同时存在于 Zen 与 Go 时按 `prefer` 配置排列认证 Key 顺序：值为 `go` 时先 Go 后 Zen，值为 `zen` 时先 Zen 后 Go（默认 `go`）。首选 Tier 失败后才回退另一 Tier；仅存在于某一池时只使用该池的 key。免费模型在这条认证顺序之前额外尝试匿名 Zen。
 
 ### Thinking 工具历史兼容
@@ -324,6 +327,10 @@ socks5://127.0.0.1:1080  # 备用代理
 所有请求都会经过同一个上游请求准备流程，同协议转发和跨协议转换不再使用两套分支。通过 Chat Completions 或 Anthropic Messages API 调用 DeepSeek、Kimi/Moonshot 或 MiMo 模型时，代理会按上游的目标协议规范化 assistant 工具历史：Chat 补全缺失或空的 `reasoning_content`；Anthropic 保留有效 thinking 文本、为缺失或空的 thinking 补充兼容占位内容、将 `redacted_thinking` 转为普通 thinking，并移除这些兼容端点不接受的 `signature`。显式启用 reasoning/thinking 的别名模型也会启用该处理，普通非 reasoning 请求不会被修改。
 
 跨协议桥接会区分 Chat/Responses 的 system 与 developer 指令，在 Anthropic 目标中按顺序合并为 system 内容；reasoning effort 会转换为兼容 thinking 预算。工具选择、空参数 `{}`、停止原因，以及 SSE 中延迟到达的工具名称、参数分片和完成事件也会转换到目标协议的对应形态。
+
+流式响应会兼容 Chat 上游的 `delta.reasoning_content` 与 `delta.reasoning`。Anthropic 上游的 `event: error`、Responses 上游的 `response.failed` 以及 Chat 的错误类 `finish_reason` 会转换为目标协议的结构化错误事件，不会伪装成正常结束或静默断流。`redacted_thinking` 在支持加密 reasoning 的 Responses 目标中保留 `encrypted_content`，在无法表达加密块的 Chat/Anthropic 目标中使用 `[redacted thinking]` 明确占位。
+
+协议文档未定义或当前 bridge 无法无损表达的输入 content block（例如未实现的音频/文件类型）会返回明确的转换错误，不再静默丢弃内容。
 
 ### `performance`
 
@@ -370,9 +377,10 @@ keys、proxy、上游、重试、模型、性能、优先 tier 和日志级别�
 代理会为上游添加 OpenCode 使用的 `User-Agent`、`x-opencode-client`、`x-opencode-session`、`x-opencode-request` 和 `x-opencode-project` 请求头。
 
 - 每个请求使用不同的 `x-opencode-request`，同一次请求的重试保持不变。
-- 优先使用客户端提供的 `x-opencode-session`、`x-session-id`、`conversation-id`、`conversation_id` 或 `metadata.session_id` 生成会话 ID。
+- 优先使用客户端提供的 `x-opencode-session`、`x-session-affinity`、`X-Session-Id`、`x-session-id`、`conversation-id`、`conversation_id` 或 `metadata.session_id` 生成会话 ID。
 - 没有显式会话标识时，使用第一条用户消息生成稳定会话 ID，使同一段多轮对话保持一致。
 - 如果两个独立会话的第一条消息完全相同，建议由客户端发送不同的 `x-session-id`，以确保两个会话严格分离。
+- 上游请求同时发送 `x-session-affinity`、`X-Session-Id` 和可选的 `x-parent-session-id`，以兼容 OpenCode 近期的会话关联要求。
 
 ## 致谢
 
