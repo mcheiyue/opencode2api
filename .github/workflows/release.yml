@@ -177,6 +177,7 @@ jobs:
           images: ${{ needs.prepare.outputs.image_name }}
           tags: |
             type=raw,value=${{ needs.prepare.outputs.release_tag }}
+            type=raw,value=latest
             type=semver,pattern={{version}},value=${{ needs.prepare.outputs.release_tag }}
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.prepare.outputs.release_tag }},enable=${{ !contains(needs.prepare.outputs.release_tag, '-') }}
             type=semver,pattern={{major}},value=${{ needs.prepare.outputs.release_tag }},enable=${{ !contains(needs.prepare.outputs.release_tag, '-') }}
