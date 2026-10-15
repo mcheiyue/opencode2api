@@ -4,12 +4,15 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"unicode/utf8"
+
+	"opencode2api/internal/identity"
 )
 
 var errStreamUpstreamFailure = errors.New("upstream stream failure delivered")
@@ -126,6 +129,36 @@ func emitUnexpectedStreamError(emitter *bridgeStreamEmitter, cause error) error 
 	return err
 }
 
+// emitSalvagedToolFinish closes a Chat stream that died after the upstream had
+// delivered every tool call in full. The client holds valid tool_call frames
+// but never the terminal chunk, so without this it reports a failed turn for a
+// tool step that is actually complete. Only Chat is handled: the lane that
+// truncates this way is Chat-only, and the other protocols' terminals need the
+// per-block bookkeeping this observer does not keep.
+func emitSalvagedToolFinish(w io.Writer, flusher http.Flusher, protocol Protocol, model, responseID string) error {
+	if protocol != Chat {
+		return fmt.Errorf("no salvaged tool terminal for %s stream", protocol)
+	}
+	if responseID == "" {
+		responseID = identity.RandomID("chatcmpl", 12)
+	}
+	emitter := newBridgeStreamEmitter(w, flusher, protocol, model)
+	if err := emitter.sse("", map[string]any{
+		"id":      responseID,
+		"object":  "chat.completion.chunk",
+		"created": emitter.created,
+		"model":   model,
+		"choices": []any{map[string]any{
+			"index":         0,
+			"delta":         map[string]any{},
+			"finish_reason": "tool_calls",
+		}},
+	}); err != nil {
+		return err
+	}
+	return emitter.rawSSE("", "[DONE]")
+}
+
 func ClientCanceled(ctx context.Context, streamErr error) bool {
 	if errors.Is(streamErr, context.Canceled) {
 		return true
@@ -183,10 +216,19 @@ type streamUsageObserver struct {
 	// trackContent gates both builders: without a mounted resumer the
 	// disabled path must not pay any copy cost (review: "disabled path
 	// not free").
-	text           strings.Builder
-	reasoning      strings.Builder
-	trackContent   bool
-	toolSeen       bool
+	text         strings.Builder
+	reasoning    strings.Builder
+	trackContent bool
+	toolSeen     bool
+	// trackTools accumulates each tool call's name and argument fragments so a
+	// stream that dies after a complete tool call can be closed with a real
+	// terminal instead of an error. Only Chat streams truncate this way (the
+	// continuation lane is Chat-only), so other protocols pay nothing.
+	trackTools     bool
+	toolNames      map[string]string
+	toolArgs       map[string]*strings.Builder
+	toolOrder      []string
+	responseID     string
 	visibleBytes   int
 	reasoningBytes int
 	errorType      string
@@ -195,11 +237,20 @@ type streamUsageObserver struct {
 
 const maxErrorDetailBytes = 1024
 
+// maxToolArgumentsBytes bounds one tool call's accumulated arguments; a larger
+// object cannot parse and is treated as incomplete.
+const maxToolArgumentsBytes = 1 << 20
+
 func newStreamUsageObserver(protocol Protocol) *streamUsageObserver {
-	return &streamUsageObserver{parser: &bridgeStreamParser{
-		protocol: protocol, tools: map[string]bool{}, toolIDs: map[string]string{}, toolNames: map[string]string{},
-		responseArgs: map[string]bool{}, responseReasoning: map[string]bool{},
-	}}
+	return &streamUsageObserver{
+		parser: &bridgeStreamParser{
+			protocol: protocol, tools: map[string]bool{}, toolIDs: map[string]string{}, toolNames: map[string]string{},
+			responseArgs: map[string]bool{}, responseReasoning: map[string]bool{},
+		},
+		trackTools: protocol == Chat,
+		toolNames:  map[string]string{},
+		toolArgs:   map[string]*strings.Builder{},
+	}
 }
 
 func (observer *streamUsageObserver) Write(data []byte) (int, error) {
@@ -260,6 +311,53 @@ func (observer *streamUsageObserver) ReasoningRunes() int {
 // inside a tool call must never be resumed as plain text.
 func (observer *streamUsageObserver) ToolSeen() bool { return observer.toolSeen }
 
+// ResponseID is the id the upstream announced for this stream, so a synthetic
+// terminal chunk carries the same id as the frames it closes.
+func (observer *streamUsageObserver) ResponseID() string { return observer.responseID }
+
+// noteTool registers a tool call in stream order and returns its argument
+// builder, or nil when the event carries no usable key.
+func (observer *streamUsageObserver) noteTool(key, name string) *strings.Builder {
+	if key == "" {
+		return nil
+	}
+	builder, seen := observer.toolArgs[key]
+	if !seen {
+		builder = &strings.Builder{}
+		observer.toolArgs[key] = builder
+		observer.toolOrder = append(observer.toolOrder, key)
+	}
+	if name != "" {
+		observer.toolNames[key] = name
+	}
+	return builder
+}
+
+// CompleteToolCalls reports whether every tool call seen on the stream has a
+// name and an argument object that parses. The upstream marks the end of a
+// call's arguments only in the terminal chunk, which a truncated stream never
+// sent, so a parseable object is the only evidence a call is whole; arguments
+// cut mid-JSON fail to parse and are rejected.
+func (observer *streamUsageObserver) CompleteToolCalls() bool {
+	if len(observer.toolOrder) == 0 {
+		return false
+	}
+	for _, key := range observer.toolOrder {
+		if observer.toolNames[key] == "" {
+			return false
+		}
+		builder := observer.toolArgs[key]
+		if builder == nil || builder.Len() == 0 {
+			return false
+		}
+		var arguments map[string]any
+		if err := json.Unmarshal([]byte(builder.String()), &arguments); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
 // TailRunes returns the last n runes of the delivered text, rune-safe, for
 // the LCP overlap window of a continuation segment.
 func (observer *streamUsageObserver) TailRunes(n int) string {
@@ -295,6 +393,10 @@ func (observer *streamUsageObserver) consume(frame []byte) {
 			switch event.Kind {
 			case "done":
 				observer.normal = true
+			case "start":
+				if observer.responseID == "" {
+					observer.responseID = event.ResponseID
+				}
 			case "error":
 				observer.error = true
 				if observer.errorMessage == "" && observer.errorType == "" {
@@ -318,6 +420,12 @@ func (observer *streamUsageObserver) consume(frame []byte) {
 				}
 			case "tool_start", "tool_delta":
 				observer.toolSeen = true
+				if observer.trackTools {
+					builder := observer.noteTool(event.ToolKey, event.ToolName)
+					if event.Kind == "tool_delta" && builder != nil && event.Text != "" && builder.Len() < maxToolArgumentsBytes {
+						builder.WriteString(event.Text)
+					}
+				}
 			}
 			if event.Usage != nil {
 				observer.reported = true

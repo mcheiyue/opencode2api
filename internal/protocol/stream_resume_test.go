@@ -41,6 +41,17 @@ func toolCallFrame() string {
 	}}})
 }
 
+func toolCallFrameWith(index int, id, arguments string) string {
+	return chatFrame(map[string]any{"tool_calls": []any{map[string]any{
+		"index": index, "id": id, "type": "function",
+		"function": map[string]any{"name": "bash", "arguments": arguments},
+	}}})
+}
+
+func completeToolCallFrame() string {
+	return toolCallFrameWith(0, "call_1", `{"cmd":"ls"}`)
+}
+
 const doneFrame = "data: [DONE]\n\n"
 
 const tornFragment = `data: {"id":"chatcmpl-test","choices":[{"delta":{"content":"wor`
@@ -582,5 +593,85 @@ func TestObserverUpstreamErrorDefaultsToSentinel(t *testing.T) {
 	observer := newStreamUsageObserver(Chat)
 	if got := observer.UpstreamError(); got.Error() != errStreamUpstreamFailure.Error() {
 		t.Fatalf("observer without an error frame must return the bare sentinel: %v", got)
+	}
+}
+
+func TestObserverCompleteToolCalls(t *testing.T) {
+	complete := newStreamUsageObserver(Chat)
+	if _, err := complete.Write([]byte(roleFrame() + completeToolCallFrame())); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	complete.Finish()
+	if !complete.CompleteToolCalls() {
+		t.Fatal("CompleteToolCalls() = false for a fully delivered tool call")
+	}
+
+	partial := newStreamUsageObserver(Chat)
+	if _, err := partial.Write([]byte(roleFrame() + toolCallFrame())); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	partial.Finish()
+	if partial.CompleteToolCalls() {
+		t.Fatal("CompleteToolCalls() = true for arguments cut mid-JSON")
+	}
+
+	namelessFrame := chatFrame(map[string]any{"tool_calls": []any{map[string]any{
+		"index": 0, "id": "call_1", "function": map[string]any{"arguments": `{"cmd":"ls"}`},
+	}}})
+	nameless := newStreamUsageObserver(Chat)
+	if _, err := nameless.Write([]byte(roleFrame() + namelessFrame)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	nameless.Finish()
+	if nameless.CompleteToolCalls() {
+		t.Fatal("CompleteToolCalls() = true for a tool call without a name")
+	}
+
+	none := newStreamUsageObserver(Chat)
+	if _, err := none.Write([]byte(roleFrame() + contentFrame("hello"))); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	none.Finish()
+	if none.CompleteToolCalls() {
+		t.Fatal("CompleteToolCalls() = true without any tool call")
+	}
+}
+
+func TestForwardStreamResumable_salvagesCompleteToolCall(t *testing.T) {
+	torn := roleFrame() + completeToolCallFrame() + tornFragment
+	resumer := &fakeResumer{}
+	rec := httptest.NewRecorder()
+	_, _, err := ForwardStreamResumable(context.Background(), rec, strings.NewReader(torn), Chat, "test-model", resumer, 1)
+	if err != nil {
+		t.Fatalf("a fully delivered tool call must not be reported as a failure: %v", err)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "upstream_error") {
+		t.Fatalf("expected no in-band error frame, got %q", body)
+	}
+	if !strings.Contains(body, `"finish_reason":"tool_calls"`) || !strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("missing salvaged tool terminal: %q", body)
+	}
+	if len(resumer.calls) != 0 {
+		t.Fatalf("resumer called %d times, want 0", len(resumer.calls))
+	}
+	if len(resumer.skipped) != 1 || resumer.skipped[0] != "tool_seen" {
+		t.Fatalf("skip telemetry = %v, want [tool_seen]", resumer.skipped)
+	}
+}
+
+func TestForwardStreamResumable_partialSiblingToolCallStillFails(t *testing.T) {
+	torn := roleFrame() +
+		completeToolCallFrame() +
+		toolCallFrameWith(1, "call_2", `{"cmd":"ls`) +
+		tornFragment
+	resumer := &fakeResumer{}
+	rec := httptest.NewRecorder()
+	_, _, err := ForwardStreamResumable(context.Background(), rec, strings.NewReader(torn), Chat, "test-model", resumer, 1)
+	if err == nil {
+		t.Fatal("one complete tool call must not mask a sibling cut mid-arguments")
+	}
+	if !strings.Contains(rec.Body.String(), "upstream_error") {
+		t.Fatalf("expected an in-band error frame, got %q", rec.Body.String())
 	}
 }

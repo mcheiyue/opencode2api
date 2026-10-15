@@ -123,6 +123,14 @@ func ForwardStreamResumable(ctx context.Context, w http.ResponseWriter, reader i
 			}
 			reportResumeSkipped(resumer, reason, observer.visibleBytes, observer.reasoningBytes, observer.toolSeen)
 		}
+		if observer.ToolSeen() && observer.CompleteToolCalls() {
+			// Every tool call arrived in full; only the terminal chunk is
+			// missing, so closing the turn beats reporting a failure.
+			if err := emitSalvagedToolFinish(w, flusher, protocol, model, observer.ResponseID()); err == nil {
+				closeCurrentIfNotFirst(reader, first)
+				return usage, observer.Reported(), nil
+			}
+		}
 		cause := observer.ParseError()
 		if copyErr != nil {
 			cause = copyErr
