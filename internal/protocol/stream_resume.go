@@ -51,7 +51,7 @@ func ForwardStreamResumable(ctx context.Context, w http.ResponseWriter, reader i
 			if copyErr != nil {
 				return usage, observer.Reported(), copyErr
 			}
-			return usage, observer.Reported(), errStreamUpstreamFailure
+			return usage, observer.Reported(), observer.UpstreamError()
 		}
 		if observer.NormalTermination() && observer.ParseError() == nil {
 			closeCurrentIfNotFirst(reader, first)

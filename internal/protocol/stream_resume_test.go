@@ -558,3 +558,29 @@ func TestContinuationFrameFilter_keepsFinishAndUsage(t *testing.T) {
 		t.Fatalf("usage frame dropped: %q", got)
 	}
 }
+
+func TestObserverCarriesUpstreamErrorDetail(t *testing.T) {
+	observer := newStreamUsageObserver(Chat)
+	observer.trackContent = true
+	errorFrame := `data: {"error":{"message":"free tier rate limited","type":"rate_limit_error"}}` + "\n\n"
+	if _, err := observer.Write([]byte(errorFrame)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if !observer.ErrorTermination() {
+		t.Fatal("error frame must terminate the stream as an error")
+	}
+	got := observer.UpstreamError()
+	if !errors.Is(got, errStreamUpstreamFailure) {
+		t.Fatalf("detail must wrap the sentinel so errors.Is still matches: %v", got)
+	}
+	if !strings.Contains(got.Error(), "free tier rate limited") || !strings.Contains(got.Error(), "rate_limit_error") {
+		t.Fatalf("upstream type/message not carried into the error: %v", got)
+	}
+}
+
+func TestObserverUpstreamErrorDefaultsToSentinel(t *testing.T) {
+	observer := newStreamUsageObserver(Chat)
+	if got := observer.UpstreamError(); got.Error() != errStreamUpstreamFailure.Error() {
+		t.Fatalf("observer without an error frame must return the bare sentinel: %v", got)
+	}
+}

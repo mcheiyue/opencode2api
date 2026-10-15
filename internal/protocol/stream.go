@@ -189,7 +189,11 @@ type streamUsageObserver struct {
 	toolSeen       bool
 	visibleBytes   int
 	reasoningBytes int
+	errorType      string
+	errorMessage   string
 }
+
+const maxErrorDetailBytes = 1024
 
 func newStreamUsageObserver(protocol Protocol) *streamUsageObserver {
 	return &streamUsageObserver{parser: &bridgeStreamParser{
@@ -226,6 +230,16 @@ func (observer *streamUsageObserver) NormalTermination() bool { return observer.
 func (observer *streamUsageObserver) ErrorTermination() bool { return observer.error }
 
 func (observer *streamUsageObserver) ParseError() error { return observer.parseErr }
+
+// UpstreamError returns the error reported when the upstream delivered its
+// own error frame, wrapping errStreamUpstreamFailure so errors.Is still
+// matches while the gateway logs the real upstream type and message.
+func (observer *streamUsageObserver) UpstreamError() error {
+	if observer.errorType == "" && observer.errorMessage == "" {
+		return errStreamUpstreamFailure
+	}
+	return fmt.Errorf("%w: type=%s message=%s", errStreamUpstreamFailure, observer.errorType, observer.errorMessage)
+}
 
 // Text returns the visible text delivered downstream so far, capped at 1 MiB.
 func (observer *streamUsageObserver) Text() string { return observer.text.String() }
@@ -283,6 +297,13 @@ func (observer *streamUsageObserver) consume(frame []byte) {
 				observer.normal = true
 			case "error":
 				observer.error = true
+				if observer.errorMessage == "" && observer.errorType == "" {
+					observer.errorType = event.ErrorType
+					observer.errorMessage = event.Error
+					if len(observer.errorMessage) > maxErrorDetailBytes {
+						observer.errorMessage = observer.errorMessage[:maxErrorDetailBytes]
+					}
+				}
 			case "text":
 				observer.visibleBytes += len(event.Text)
 				// Stop appending once the cap is reached; the continuation
