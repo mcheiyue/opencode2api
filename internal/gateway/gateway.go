@@ -41,6 +41,10 @@ func attemptDeadline(cfg config.Config) time.Duration {
 // gateway could answer, so the failure is neither upstream nor ours.
 const statusClientClosedRequest = 499
 
+// proxyUnavailableMessage is returned when every attempt died on the proxy
+// route itself, so operators look at their proxies instead of the upstream.
+const proxyUnavailableMessage = "all proxies are unavailable; the upstream could not be reached"
+
 type Gateway struct {
 	rotation     *rotation.Manager
 	cfg          config.Config
@@ -232,6 +236,12 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 				return
 			}
 			g.logger.Warn("all upstream attempts failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "tier", finalTier, "key_id", keyID, "channel", channel, "anonymous", anonymous, "error", err)
+			// The request never reached the upstream because the proxy route
+			// failed; report that instead of blaming the upstream with a 502.
+			if errors.Is(err, errProxyUnavailable) {
+				wire.WriteError(w, external, http.StatusServiceUnavailable, proxyUnavailableMessage, "proxy_error", ids.Request)
+				return
+			}
 			// An exhausted request budget is a timeout, not a bad gateway: the
 			// distinction matters to clients that retry on 502.
 			if errors.Is(err, context.DeadlineExceeded) {
@@ -419,6 +429,10 @@ func (g *Gateway) forwardSystemOne(w http.ResponseWriter, r *http.Request, body 
 			return
 		}
 		g.logger.Warn("all upstream attempts failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "tier", finalTier, "key_id", keyID, "channel", channel, "anonymous", anonymous, "error", err)
+		if errors.Is(err, errProxyUnavailable) {
+			wire.WriteError(w, wire.SystemOne, http.StatusServiceUnavailable, proxyUnavailableMessage, "proxy_error", ids.Request)
+			return
+		}
 		if errors.Is(err, context.DeadlineExceeded) {
 			wire.WriteError(w, wire.SystemOne, http.StatusGatewayTimeout, "upstream request timed out", "upstream_timeout", ids.Request)
 			return
