@@ -435,3 +435,68 @@ func TestResumeSegmentDisabledBudgetSkipsUpstream(t *testing.T) {
 		t.Fatalf("resume telemetry = skipped:%q attempts:%d", meta.ResumeSkipped, meta.ResumeAttempts)
 	}
 }
+
+func TestAttemptTimeoutFromOnlyTightens(t *testing.T) {
+	ctx := context.Background()
+	if got := attemptTimeoutFrom(ctx, 60*time.Second); got != 60*time.Second {
+		t.Fatalf("no override: got %v, want the fallback", got)
+	}
+	tightened := withContinuationAttemptTimeout(ctx, 20*time.Second)
+	if got := attemptTimeoutFrom(tightened, 60*time.Second); got != 20*time.Second {
+		t.Fatalf("override: got %v, want 20s", got)
+	}
+	if got := attemptTimeoutFrom(tightened, 10*time.Second); got != 10*time.Second {
+		t.Fatalf("a shorter fallback must still win: got %v, want 10s", got)
+	}
+	if got := attemptTimeoutFrom(withContinuationAttemptTimeout(ctx, 0), 60*time.Second); got != 60*time.Second {
+		t.Fatalf("a zero override must be ignored: got %v, want 60s", got)
+	}
+}
+
+// A wedged exit must not be able to consume a continuation budget by sitting on
+// the request-level attempt timeout: with the continuation attempt bound in
+// effect each attempt fails in ~200ms instead of holding for the whole budget.
+func TestResumeSegmentBoundsEachContinuationAttempt(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(time.Second):
+		}
+	}))
+	defer server.Close()
+
+	performance := config.PerformanceConfig{
+		MaxIdleConns: 2, MaxIdleConnsPerHost: 2, ConnectTimeoutSeconds: 1,
+		IdleConnTimeoutSeconds: 10, FailureCooldownSeconds: 1,
+		FirstEventTimeoutSeconds: 0, StreamContinuationTimeoutSeconds: 5,
+	}
+	transports, err := newTransportPool([]string{"direct", "direct"}, performance, 0)
+	if err != nil {
+		t.Fatalf("newTransportPool: %v", err)
+	}
+	meta := &telemetry.RequestMeta{}
+	g := &Gateway{
+		cfg:       config.Config{Anonymous: true, Upstream: config.UpstreamConfig{Zen: server.URL, Anonymous: server.URL}, Performance: performance},
+		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		anonymous: newAnonymousPool(true, transports, time.Second),
+	}
+	resumer := &gatewayStreamResumer{
+		g: g, clientCtx: context.Background(),
+		continuationTimeout: 5 * time.Second, attemptTimeout: 200 * time.Millisecond,
+		route:   models.Route{ID: "test-model", Tier: config.TierZen, Protocol: wire.Chat},
+		ids:     identity.RequestIDs{Session: "ses_wedged", Request: "req_wedged"},
+		zenBody: baseZenBody(t, []any{map[string]any{"role": "user", "content": "hello"}}), meta: meta,
+	}
+	started := time.Now()
+	_, err = resumer.ResumeSegment("partial answer", "")
+	elapsed := time.Since(started)
+	if !errors.Is(err, errAttemptTimeout) {
+		t.Fatalf("ResumeSegment error = %v, want errAttemptTimeout", err)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("two wedged exits burned %v of a 5s budget; the attempt bound did not apply", elapsed)
+	}
+	if meta.ResumeAttempts != 1 || meta.ResumeFailures != 1 {
+		t.Fatalf("resume telemetry = attempts:%d failures:%d", meta.ResumeAttempts, meta.ResumeFailures)
+	}
+}

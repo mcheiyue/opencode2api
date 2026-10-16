@@ -101,18 +101,22 @@ type WebUIConfig struct {
 // StreamContinuationTimeoutSeconds bounds each continuation fetch on its own
 // budget derived from the client connection, not from the request-level retry
 // timeout. Valid values are 1 through 86400 seconds.
+// StreamContinuationAttemptTimeoutSeconds bounds one continuation attempt, so
+// a wedged exit cannot eat a budget sized for tens of seconds; 0 keeps the
+// global attempt timeout. Valid values are 1 through 86400 seconds.
 type PerformanceConfig struct {
-	MaxIdleConns                     int  `json:"max_idle_conns"`
-	MaxIdleConnsPerHost              int  `json:"max_idle_conns_per_host"`
-	MaxConnsPerHost                  int  `json:"max_conns_per_host"`
-	IdleConnTimeoutSeconds           int  `json:"idle_conn_timeout_seconds"`
-	ConnectTimeoutSeconds            int  `json:"connect_timeout_seconds"`
-	FailureCooldownSeconds           int  `json:"failure_cooldown_seconds"`
-	AttemptTimeoutSeconds            int  `json:"attempt_timeout_seconds"`
-	FirstEventTimeoutSeconds         int  `json:"first_event_timeout_seconds"`
-	StreamContinuation               bool `json:"stream_continuation"`
-	StreamContinuationMax            int  `json:"stream_continuation_max"`
-	StreamContinuationTimeoutSeconds int  `json:"stream_continuation_timeout_seconds"`
+	MaxIdleConns                            int  `json:"max_idle_conns"`
+	MaxIdleConnsPerHost                     int  `json:"max_idle_conns_per_host"`
+	MaxConnsPerHost                         int  `json:"max_conns_per_host"`
+	IdleConnTimeoutSeconds                  int  `json:"idle_conn_timeout_seconds"`
+	ConnectTimeoutSeconds                   int  `json:"connect_timeout_seconds"`
+	FailureCooldownSeconds                  int  `json:"failure_cooldown_seconds"`
+	AttemptTimeoutSeconds                   int  `json:"attempt_timeout_seconds"`
+	FirstEventTimeoutSeconds                int  `json:"first_event_timeout_seconds"`
+	StreamContinuation                      bool `json:"stream_continuation"`
+	StreamContinuationMax                   int  `json:"stream_continuation_max"`
+	StreamContinuationTimeoutSeconds        int  `json:"stream_continuation_timeout_seconds"`
+	StreamContinuationAttemptTimeoutSeconds int  `json:"stream_continuation_attempt_timeout_seconds"`
 }
 
 // StreamContinuationTimeout bounds one mid-stream continuation fetch. The
@@ -125,6 +129,16 @@ func (cfg PerformanceConfig) StreamContinuationTimeout() time.Duration {
 		return 0
 	}
 	return time.Duration(cfg.StreamContinuationTimeoutSeconds) * time.Second
+}
+
+// StreamContinuationAttemptTimeout bounds one attempt inside a continuation
+// fetch. A non-positive value reports zero, which makes the attempt loop fall
+// back to the global attempt timeout.
+func (cfg PerformanceConfig) StreamContinuationAttemptTimeout() time.Duration {
+	if cfg.StreamContinuationAttemptTimeoutSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(cfg.StreamContinuationAttemptTimeoutSeconds) * time.Second
 }
 
 // AttemptTimeout bounds how long a single upstream attempt may wait for
@@ -165,7 +179,7 @@ func Load(path string) (Config, error) {
 		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/zen", Go: "https://opencode.ai/zen/go", Anonymous: "https://opencode.ai/inference"},
 		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300},
 		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
-		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15, StreamContinuation: false, StreamContinuationMax: 1, StreamContinuationTimeoutSeconds: 60},
+		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15, StreamContinuation: false, StreamContinuationMax: 1, StreamContinuationTimeoutSeconds: 60, StreamContinuationAttemptTimeoutSeconds: 20},
 		Logging:     LoggingConfig{Level: "info", RingSize: 2000},
 		WebUI:       WebUIConfig{Listen: "0.0.0.0:8081", SessionTTLMinutes: 720},
 		Prefer:      TierGo,
@@ -242,6 +256,9 @@ func Normalize(path string, cfg Config) (Config, error) {
 	}
 	if cfg.Performance.StreamContinuationTimeoutSeconds < 1 || cfg.Performance.StreamContinuationTimeoutSeconds > 86400 {
 		return Config{}, errors.New("performance.stream_continuation_timeout_seconds must be between 1 and 86400")
+	}
+	if cfg.Performance.StreamContinuationAttemptTimeoutSeconds < 0 || cfg.Performance.StreamContinuationAttemptTimeoutSeconds > 86400 {
+		return Config{}, errors.New("performance.stream_continuation_attempt_timeout_seconds must be between 0 and 86400 (0 keeps the attempt timeout)")
 	}
 	if cfg.Logging.Level != "debug" && cfg.Logging.Level != "info" && cfg.Logging.Level != "warn" && cfg.Logging.Level != "error" {
 		return Config{}, errors.New("logging.level must be debug, info, warn, or error")

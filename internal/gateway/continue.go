@@ -34,6 +34,7 @@ type gatewayStreamResumer struct {
 	clientCtx           context.Context
 	streamState         *anonymousStreamState
 	continuationTimeout time.Duration
+	attemptTimeout      time.Duration
 	route               models.Route
 	ids                 identity.RequestIDs
 	zenBody             []byte
@@ -75,6 +76,7 @@ func (r *gatewayStreamResumer) ResumeSegment(partial string, reasoning string) (
 	}
 	continuationCtx, cancel := context.WithCancelCause(r.clientCtx)
 	continuationCtx = context.WithValue(continuationCtx, anonymousStreamStateKey{}, r.streamState)
+	continuationCtx = withContinuationAttemptTimeout(continuationCtx, r.attemptTimeout)
 	var timeoutMu sync.Mutex
 	timeoutCommitted := false
 	timer := time.AfterFunc(r.continuationTimeout, func() {
@@ -106,7 +108,7 @@ func (r *gatewayStreamResumer) ResumeSegment(partial string, reasoning string) (
 		if r.meta != nil {
 			kind = r.meta.ResumeKind
 		}
-		r.g.logger.Info("stream continuation attempt dispatched", "component", "upstream", "event", "stream_continuation_attempted", "request_id", r.ids.Request, "model", r.route.ID, "partial_bytes", len(partial), "reasoning_bytes", len(reasoning), "resume_kind", kind, "timeout_ms", r.continuationTimeout.Milliseconds())
+		r.g.logger.Info("stream continuation attempt dispatched", "component", "upstream", "event", "stream_continuation_attempted", "request_id", r.ids.Request, "model", r.route.ID, "partial_bytes", len(partial), "reasoning_bytes", len(reasoning), "resume_kind", kind, "timeout_ms", r.continuationTimeout.Milliseconds(), "attempt_timeout_ms", r.attemptTimeout.Milliseconds())
 	}
 	resp, err, attempts := r.g.doAnonymousUpstream(continuationCtx, r.route, bodies, r.ids, r.attemptOffset)
 	r.attemptOffset += attempts

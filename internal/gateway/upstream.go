@@ -74,6 +74,32 @@ func anonymousStreamStateFrom(ctx context.Context) *anonymousStreamState {
 	return state
 }
 
+type continuationAttemptTimeoutKey struct{}
+
+// withContinuationAttemptTimeout tightens the per-attempt deadline for one
+// continuation fetch, whose budget is tens of seconds compared to the
+// request-level one the global attempt timeout is sized for.
+func withContinuationAttemptTimeout(ctx context.Context, timeout time.Duration) context.Context {
+	if timeout <= 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, continuationAttemptTimeoutKey{}, timeout)
+}
+
+// attemptTimeoutFrom resolves the per-attempt deadline for a ctx-carried
+// override. The override only ever tightens: a shorter global attempt timeout
+// still wins.
+func attemptTimeoutFrom(ctx context.Context, fallback time.Duration) time.Duration {
+	override, ok := ctx.Value(continuationAttemptTimeoutKey{}).(time.Duration)
+	if !ok || override <= 0 {
+		return fallback
+	}
+	if fallback > 0 && override > fallback {
+		return fallback
+	}
+	return override
+}
+
 // markCurrentStreamExitFailed cools down the anonymous exit that just broke
 // mid-stream. Without this, the FNV session cursor of the continuation fetch
 // would land on the same dead exit again. Clearing the node afterwards lets
@@ -336,7 +362,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		}
 		setRequestCredential(ctx, config.TierZen, "anonymous", "anonymous", true, node.proxy)
 		started := time.Now()
-		resp, err := doInferenceAttempt(node.proxy.client, req, time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds)*time.Second, g.attemptTimeout)
+		resp, err := doInferenceAttempt(node.proxy.client, req, time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds)*time.Second, attemptTimeoutFrom(ctx, g.attemptTimeout))
 		duration := time.Since(started)
 		if ctx.Err() != nil {
 			// The parent budget expired while this attempt was in flight. Its
