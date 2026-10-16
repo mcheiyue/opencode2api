@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"opencode2api/internal/buildinfo"
-	"opencode2api/internal/config"
 	"opencode2api/internal/httpx"
 	modelcatalog "opencode2api/internal/models"
 	wire "opencode2api/internal/protocol"
@@ -208,12 +207,9 @@ func (g *Gateway) handleModels(w http.ResponseWriter, _ *http.Request) {
 		data = append(data, entry)
 	}
 	for _, group := range g.rotation.Snapshot().Groups {
-		if g.goNodes.Len() == 0 {
-			continue
-		}
 		available := false
 		for _, model := range group.Order {
-			if route, err := g.catalog.RouteForTier(model, config.TierGo, false, true); err == nil && route.Protocol != wire.SystemOne {
+			if route, err := g.catalog.Route(model, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0, g.cfg.Anonymous); err == nil && route.Protocol != wire.SystemOne {
 				available = true
 				break
 			}

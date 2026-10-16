@@ -23,7 +23,7 @@ import (
 func (g *Gateway) syncRotation() {
 	available := map[string]bool{}
 	for _, model := range g.catalog.List() {
-		if route, err := g.catalog.RouteForTier(model, config.TierGo, false, g.goNodes.Len() > 0); err == nil && route.Protocol != wire.SystemOne {
+		if route, err := g.catalog.Route(model, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0, g.cfg.Anonymous); err == nil && route.Protocol != wire.SystemOne {
 			available[model] = true
 		}
 	}
@@ -81,7 +81,7 @@ func (g *Gateway) handleRotation(w http.ResponseWriter, r *http.Request, externa
 			break
 		}
 		visited[token.Model] = true
-		route, err := g.catalog.RouteForTier(token.Model, config.TierGo, false, g.goNodes.Len() > 0)
+		route, err := g.catalog.Route(token.Model, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0, g.cfg.Anonymous)
 		if err != nil {
 			continue
 		}
@@ -90,7 +90,7 @@ func (g *Gateway) handleRotation(w http.ResponseWriter, r *http.Request, externa
 			total++
 			if meta != nil {
 				meta.Model = token.Model
-				meta.Tier = "go"
+				meta.Tier = string(route.Tier)
 				meta.Protocol = route.Protocol
 				meta.Attempts = total
 				meta.Usage = wire.Usage{}
@@ -181,36 +181,44 @@ func (g *Gateway) rotationAttempt(parent context.Context, w http.ResponseWriter,
 		result.reason = "request_conversion_error"
 		return result
 	}
-	body, shaped := g.shapeKeyBody(bodies[config.TierGo], route, config.TierGo)
-	cursor := g.goNodes.CursorFor(ids.Session)
-	var node *upstreamNode
-	// Each group attempt is exactly one HTTP call. Key selection may change,
-	// but there is no nested retry, stale-reasoning replay, or model-wide key ban.
-	for n := 0; n < attempt; n++ {
-		node = cursor.Next()
+	var resp *http.Response
+	var shaped bool
+	if route.Anonymous {
+		resp, err, _ = g.doAnonymousUpstream(ctx, route, bodies, ids, attempt-1)
+	} else {
+		body, keyShaped := g.shapeKeyBody(bodies[route.Tier], route, route.Tier)
+		shaped = keyShaped
+		pool, upstreamURL := g.zenNodes, g.cfg.Upstream.Zen
+		if route.Tier == config.TierGo {
+			pool, upstreamURL = g.goNodes, g.cfg.Upstream.Go
+		}
+		cursor := pool.CursorFor(ids.Session)
+		var node *upstreamNode
+		for n := 0; n < attempt; n++ {
+			node = cursor.Next()
+		}
+		if node == nil {
+			result.err = fmt.Errorf("no %s key", route.Tier)
+			return result
+		}
+		proxy := pool.Proxy(node)
+		if proxy == nil {
+			result.err = errors.New("no proxy")
+			return result
+		}
+		req, requestErr := newUpstreamRequest(ctx, upstreamURL, route.Protocol, body, ids, node.key)
+		if requestErr != nil {
+			result.err = requestErr
+			return result
+		}
+		req.GetBody = nil
+		client := *proxy.client
+		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		setRequestCredential(parent, route.Tier, config.KeyDisplayID(node.key), "key", false, proxy)
+		started := time.Now()
+		resp, err = client.Do(req)
+		g.recordUpstreamAttempt(parent, route, ids, attempt, config.KeyDisplayID(node.key), "key", false, proxy, resp, err, time.Since(started))
 	}
-	if node == nil {
-		result.err = errors.New("no Go key")
-		return result
-	}
-	proxy := g.goNodes.Proxy(node)
-	if proxy == nil {
-		result.err = errors.New("no proxy")
-		return result
-	}
-	req, err := newUpstreamRequest(ctx, g.cfg.Upstream.Go, route.Protocol, body, ids, node.key)
-	if err != nil {
-		result.err = err
-		return result
-	}
-	// A reused connection must not cause net/http to implicitly replay POSTs.
-	req.GetBody = nil
-	client := *proxy.client
-	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	setRequestCredential(parent, config.TierGo, config.KeyDisplayID(node.key), "key", false, proxy)
-	started := time.Now()
-	resp, err := client.Do(req)
-	g.recordUpstreamAttempt(parent, route, ids, attempt, config.KeyDisplayID(node.key), "key", false, proxy, resp, err, time.Since(started))
 	if resp != nil {
 		defer resp.Body.Close()
 	}
@@ -294,7 +302,7 @@ func (g *Gateway) rotationAttempt(parent context.Context, w http.ResponseWriter,
 		result.reason = "first_output_timeout"
 		return result
 	}
-	if shaped {
+	if route.Anonymous || shaped {
 		b, err = wire.CollapseStream(bytes.NewReader(b), route.Protocol, route.ID)
 	}
 	var document map[string]any
