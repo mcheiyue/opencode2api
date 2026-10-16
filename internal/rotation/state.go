@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"sort"
 	"sync"
 	"time"
 )
@@ -52,7 +51,6 @@ type Manager struct {
 	mu    sync.Mutex
 	path  string
 	state Snapshot
-	cfg   config.RotationConfig
 }
 
 func New(path string, cfg config.RotationConfig) (*Manager, error) {
@@ -86,19 +84,7 @@ func (m *Manager) Configure(cfg config.RotationConfig) {
 			m.state.Groups = append(m.state.Groups, &Group{ID: id})
 		}
 		g := m.state.Groups[i]
-		previous := m.cfg.SOTA
-		if i == 1 {
-			previous = m.cfg.Sweet
-		}
-		order := slices.Clone(g.Order)
-		if len(order) == 0 || !slices.Equal(previous.Order, c.Order) {
-			order = slices.Clone(c.Order)
-			for _, v := range g.Order {
-				if !slices.Contains(order, v) {
-					order = append(order, v)
-				}
-			}
-		}
+		order := slices.Clone(c.Order)
 		if !slices.Equal(order, g.Order) || g.Alias != c.Alias {
 			g.Generation++
 		}
@@ -107,12 +93,14 @@ func (m *Manager) Configure(cfg config.RotationConfig) {
 		if g.Paused == nil {
 			g.Paused = map[string]time.Time{}
 		}
-		if !slices.Contains(g.Order, g.Current) && len(g.Order) > 0 {
-			g.Current = g.Order[0]
+		if !slices.Contains(g.Order, g.Current) {
+			g.Current = ""
+			if len(g.Order) > 0 {
+				g.Current = g.Order[0]
+			}
 			g.Generation++
 		}
 	}
-	m.cfg = cfg
 	m.state.FirstOutputSeconds = cfg.FirstOutputSeconds
 	m.saveLocked()
 }
@@ -123,23 +111,9 @@ func (m *Manager) Sync(available map[string]bool) {
 	for _, g := range m.state.Groups {
 		g.Available = map[string]bool{}
 		for model := range available {
-			if config.IsSOTA(model) == (g.ID == "sota") {
+			if config.IsSOTA(model) == (g.ID == "sota") && slices.Contains(g.Order, model) {
 				g.Available[model] = true
 			}
-		}
-		added := []string{}
-		for model := range g.Available {
-			if !slices.Contains(g.Order, model) {
-				added = append(added, model)
-			}
-		}
-		sort.Strings(added)
-		if len(g.Order) == 0 && slices.Contains(added, "glm-5.3-flash") {
-			added = append([]string{"glm-5.3-flash"}, slices.Delete(added, slices.Index(added, "glm-5.3-flash"), slices.Index(added, "glm-5.3-flash")+1)...)
-		}
-		if len(added) > 0 {
-			g.Order = append(g.Order, added...)
-			changed = true
 		}
 		if g.Current == "" && len(g.Order) > 0 {
 			g.Current = g.Order[0]
