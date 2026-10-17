@@ -67,6 +67,15 @@ func ForwardStreamResumable(ctx context.Context, w http.ResponseWriter, reader i
 			}
 			return usage, observer.Reported(), copyErr
 		}
+		// A tool call that arrived whole is missing only its terminal chunk,
+		// so closing the turn beats reporting a failure. Run this before the
+		// skip record below, or a salvaged request is logged as skipped.
+		if observer.ToolSeen() && observer.CompleteToolCalls() {
+			if err := emitSalvagedToolFinish(w, flusher, protocol, model, observer.ResponseID()); err == nil {
+				closeCurrentIfNotFirst(reader, first)
+				return usage, observer.Reported(), nil
+			}
+		}
 		// Unexpected termination — the only resume window.
 		if resumer != nil && resumes < maxResumes && !observer.ToolSeen() && !ClientCanceled(ctx, nil) {
 			// Rune counting runs only when a resumer is mounted; the
@@ -117,19 +126,11 @@ func ForwardStreamResumable(ctx context.Context, w http.ResponseWriter, reader i
 			reason := "resume_limit"
 			switch {
 			case resumes < maxResumes && observer.ToolSeen():
-				reason = "tool_seen"
+				reason = "tool_seen[" + observer.ToolState() + "]"
 			case resumes < maxResumes && ClientCanceled(ctx, nil):
 				reason = "client_canceled"
 			}
 			reportResumeSkipped(resumer, reason, observer.visibleBytes, observer.reasoningBytes, observer.toolSeen)
-		}
-		if observer.ToolSeen() && observer.CompleteToolCalls() {
-			// Every tool call arrived in full; only the terminal chunk is
-			// missing, so closing the turn beats reporting a failure.
-			if err := emitSalvagedToolFinish(w, flusher, protocol, model, observer.ResponseID()); err == nil {
-				closeCurrentIfNotFirst(reader, first)
-				return usage, observer.Reported(), nil
-			}
 		}
 		cause := observer.ParseError()
 		if copyErr != nil {

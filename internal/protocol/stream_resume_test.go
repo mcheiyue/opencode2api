@@ -240,8 +240,11 @@ func TestForwardStreamResumable_toolDeltaBlocksResume(t *testing.T) {
 	if len(resumer.calls) != 0 {
 		t.Fatalf("resumer called %d times after a tool delta, want 0", len(resumer.calls))
 	}
-	if len(resumer.skipped) != 1 || resumer.skipped[0] != "tool_seen" || !resumer.toolSeen {
+	if len(resumer.skipped) != 1 || !strings.HasPrefix(resumer.skipped[0], "tool_seen[") || !resumer.toolSeen {
 		t.Fatalf("resume skip telemetry = reasons:%v tool_seen:%t", resumer.skipped, resumer.toolSeen)
+	}
+	if !strings.Contains(resumer.skipped[0], "calls=1") || !strings.Contains(resumer.skipped[0], "parse=") {
+		t.Fatalf("skip reason must carry the tool state, got %q", resumer.skipped[0])
 	}
 	if !strings.Contains(rec.Body.String(), "upstream_error") {
 		t.Fatalf("expected an in-band error frame, got %q", rec.Body.String())
@@ -655,8 +658,8 @@ func TestForwardStreamResumable_salvagesCompleteToolCall(t *testing.T) {
 	if len(resumer.calls) != 0 {
 		t.Fatalf("resumer called %d times, want 0", len(resumer.calls))
 	}
-	if len(resumer.skipped) != 1 || resumer.skipped[0] != "tool_seen" {
-		t.Fatalf("skip telemetry = %v, want [tool_seen]", resumer.skipped)
+	if len(resumer.skipped) != 0 {
+		t.Fatalf("a salvaged turn must not be logged as skipped, got %v", resumer.skipped)
 	}
 }
 
@@ -673,5 +676,45 @@ func TestForwardStreamResumable_partialSiblingToolCallStillFails(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "upstream_error") {
 		t.Fatalf("expected an in-band error frame, got %q", rec.Body.String())
+	}
+}
+
+func TestObserverToolState(t *testing.T) {
+	complete := newStreamUsageObserver(Chat)
+	if _, err := complete.Write([]byte(roleFrame() + completeToolCallFrame())); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	complete.Finish()
+	if state := complete.ToolState(); state != "calls=1 named=1 argbytes=12 parse=ok" {
+		t.Fatalf("ToolState() = %q for a complete call", state)
+	}
+
+	truncated := newStreamUsageObserver(Chat)
+	if _, err := truncated.Write([]byte(roleFrame() + toolCallFrame())); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	truncated.Finish()
+	if state := truncated.ToolState(); !strings.Contains(state, "calls=1") || strings.Contains(state, "parse=ok") {
+		t.Fatalf("ToolState() = %q for arguments cut mid-JSON", state)
+	}
+
+	// A delta whose call carries neither index nor id resolves to no key, so
+	// nothing is accumulated even though the observer did see a tool delta.
+	keyless := chatFrame(map[string]any{"tool_calls": []any{map[string]any{
+		"type": "function", "function": map[string]any{"name": "bash", "arguments": `{"cmd":"ls"}`},
+	}}})
+	unkeyed := newStreamUsageObserver(Chat)
+	if _, err := unkeyed.Write([]byte(roleFrame() + keyless)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	unkeyed.Finish()
+	if !unkeyed.ToolSeen() {
+		t.Fatal("a keyless tool delta must still count as a seen tool call")
+	}
+	if state := unkeyed.ToolState(); state != "calls=0" {
+		t.Fatalf("ToolState() = %q for a keyless tool delta", state)
+	}
+	if unkeyed.CompleteToolCalls() {
+		t.Fatal("a keyless tool delta must never be treated as complete")
 	}
 }

@@ -358,6 +358,38 @@ func (observer *streamUsageObserver) CompleteToolCalls() bool {
 	return true
 }
 
+// ToolState renders a compact diagnostic of the accumulated tool calls so a
+// refused salvage can be told apart from a stream that died mid-arguments;
+// calls=0 means a tool delta arrived under an unresolvable key.
+func (observer *streamUsageObserver) ToolState() string {
+	if len(observer.toolOrder) == 0 {
+		return "calls=0"
+	}
+	named, argBytes := 0, 0
+	parseErr := ""
+	for _, key := range observer.toolOrder {
+		if observer.toolNames[key] != "" {
+			named++
+		}
+		builder := observer.toolArgs[key]
+		if builder == nil {
+			continue
+		}
+		argBytes += builder.Len()
+		if parseErr == "" {
+			var arguments map[string]any
+			if err := json.Unmarshal([]byte(builder.String()), &arguments); err != nil {
+				parseErr = err.Error()
+			}
+		}
+	}
+	state := fmt.Sprintf("calls=%d named=%d argbytes=%d", len(observer.toolOrder), named, argBytes)
+	if parseErr != "" {
+		return state + " parse=" + parseErr
+	}
+	return state + " parse=ok"
+}
+
 // TailRunes returns the last n runes of the delivered text, rune-safe, for
 // the LCP overlap window of a continuation segment.
 func (observer *streamUsageObserver) TailRunes(n int) string {
