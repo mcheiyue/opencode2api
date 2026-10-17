@@ -57,17 +57,30 @@ const doneFrame = "data: [DONE]\n\n"
 const tornFragment = `data: {"id":"chatcmpl-test","choices":[{"delta":{"content":"wor`
 
 type fakeResumer struct {
-	calls        []string
-	reasonCalls  []string
-	skipped      []string
-	visibleBytes int
-	reasonBytes  int
-	toolSeen     bool
-	silent       bool
-	segment      func(partial string, reasoning string) (io.Reader, error)
+	calls         []string
+	reasonCalls   []string
+	skipped       []string
+	visibleBytes  int
+	reasonBytes   int
+	toolSeen      bool
+	silent        bool
+	toolArgs      bool
+	toolArgsCalls []ToolArgsRequest
+	toolSegment   func(request ToolArgsRequest) (io.Reader, error)
+	segment       func(partial string, reasoning string) (io.Reader, error)
 }
 
 func (f *fakeResumer) SilentClose() bool { return f.silent }
+
+func (f *fakeResumer) ToolArgsEnabled() bool { return f.toolArgs }
+
+func (f *fakeResumer) ResumeToolArgs(request ToolArgsRequest) (io.Reader, error) {
+	f.toolArgsCalls = append(f.toolArgsCalls, request)
+	if f.toolSegment == nil {
+		return nil, errors.New("no tool args segment configured")
+	}
+	return f.toolSegment(request)
+}
 
 func (f *fakeResumer) ResumeSegment(partial string, reasoning string) (io.Reader, error) {
 	f.calls = append(f.calls, partial)
