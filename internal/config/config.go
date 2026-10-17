@@ -264,6 +264,9 @@ func Normalize(path string, cfg Config) (Config, error) {
 	if cfg.Performance.FirstEventTimeoutSeconds < 0 || cfg.Performance.FirstEventTimeoutSeconds > 86400 {
 		return Config{}, errors.New("performance.first_event_timeout_seconds must be between 0 and 86400 (0 disables the first-event timeout)")
 	}
+	if cfg.Performance.StreamContinuationTimeoutSeconds == 0 {
+		cfg.Performance.StreamContinuationTimeoutSeconds = 60
+	}
 	if cfg.Performance.StreamContinuationTimeoutSeconds < 1 || cfg.Performance.StreamContinuationTimeoutSeconds > 86400 {
 		return Config{}, errors.New("performance.stream_continuation_timeout_seconds must be between 1 and 86400")
 	}
@@ -299,7 +302,8 @@ func Normalize(path string, cfg Config) (Config, error) {
 		if raw == "direct" {
 			continue
 		}
-		u, err := url.Parse(raw)
+		clean, _ := ParseProxyEntry(raw)
+		u, err := url.Parse(clean)
 		if err != nil || u.Host == "" {
 			return Config{}, fmt.Errorf("invalid proxy URL %q", RedactURL(raw))
 		}

@@ -41,6 +41,10 @@ func attemptDeadline(cfg config.Config) time.Duration {
 // gateway could answer, so the failure is neither upstream nor ours.
 const statusClientClosedRequest = 499
 
+// proxyUnavailableMessage is returned when every attempt died on the proxy
+// route itself, so operators look at their proxies instead of the upstream.
+const proxyUnavailableMessage = "all proxies are unavailable; the upstream could not be reached"
+
 type Gateway struct {
 	rotation     *rotation.Manager
 	cfg          config.Config
@@ -232,6 +236,12 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 				return
 			}
 			g.logger.Warn("all upstream attempts failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "tier", finalTier, "key_id", keyID, "channel", channel, "anonymous", anonymous, "error", err)
+			// The request never reached the upstream because the proxy route
+			// failed; report that instead of blaming the upstream with a 502.
+			if errors.Is(err, errProxyUnavailable) {
+				wire.WriteError(w, external, http.StatusServiceUnavailable, proxyUnavailableMessage, "proxy_error", ids.Request)
+				return
+			}
 			// An exhausted request budget is a timeout, not a bad gateway: the
 			// distinction matters to clients that retry on 502.
 			if errors.Is(err, context.DeadlineExceeded) {
@@ -251,6 +261,10 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			copyErrorResponse(w, external, resp, ids.Request)
 			return
 		}
+		var toolAlias string
+		if meta != nil {
+			toolAlias = meta.ToolAlias
+		}
 		if stream {
 			if meta != nil {
 				meta.Stream = true
@@ -263,6 +277,7 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			w.Header().Set("Cache-Control", "no-cache")
 			w.Header().Set("X-Accel-Buffering", "no")
 			w.WriteHeader(resp.StatusCode)
+			streamBody := wire.RenameStreamReader(resp.Body, upstreamRoute.Protocol, legacyAnonymousReadTool, toolAlias)
 			var usage wire.Usage
 			var usageReported bool
 			if external == upstreamRoute.Protocol {
@@ -281,12 +296,12 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 						meta:                meta,
 						attemptOffset:       attemptOffsetFromMeta(meta),
 					}
-					usage, usageReported, err = wire.ForwardStreamResumable(r.Context(), w, resp.Body, upstreamRoute.Protocol, model, resumer, g.streamResumeLimit())
+					usage, usageReported, err = wire.ForwardStreamResumable(r.Context(), w, streamBody, upstreamRoute.Protocol, model, resumer, g.streamResumeLimit())
 				} else {
-					usage, usageReported, err = wire.ForwardStream(r.Context(), w, resp.Body, upstreamRoute.Protocol, model)
+					usage, usageReported, err = wire.ForwardStream(r.Context(), w, streamBody, upstreamRoute.Protocol, model)
 				}
 			} else {
-				usage, usageReported, err = wire.TranscodeStream(r.Context(), w, resp.Body, upstreamRoute.Protocol, external, model)
+				usage, usageReported, err = wire.TranscodeStream(r.Context(), w, streamBody, upstreamRoute.Protocol, external, model)
 			}
 			if meta != nil {
 				meta.Usage, meta.UsageReported = usage, usageReported
@@ -321,6 +336,7 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			}
 			responseBody = collapsed
 		}
+		responseBody = wire.RenameResponseTool(responseBody, upstreamRoute.Protocol, legacyAnonymousReadTool, toolAlias)
 		if usage, reported := wire.ResponseUsage(upstreamRoute.Protocol, responseBody); meta != nil {
 			meta.Usage, meta.UsageReported = usage, reported
 		}
@@ -419,6 +435,10 @@ func (g *Gateway) forwardSystemOne(w http.ResponseWriter, r *http.Request, body 
 			return
 		}
 		g.logger.Warn("all upstream attempts failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "tier", finalTier, "key_id", keyID, "channel", channel, "anonymous", anonymous, "error", err)
+		if errors.Is(err, errProxyUnavailable) {
+			wire.WriteError(w, wire.SystemOne, http.StatusServiceUnavailable, proxyUnavailableMessage, "proxy_error", ids.Request)
+			return
+		}
 		if errors.Is(err, context.DeadlineExceeded) {
 			wire.WriteError(w, wire.SystemOne, http.StatusGatewayTimeout, "upstream request timed out", "upstream_timeout", ids.Request)
 			return
