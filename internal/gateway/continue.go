@@ -35,6 +35,7 @@ type gatewayStreamResumer struct {
 	streamState         *anonymousStreamState
 	continuationTimeout time.Duration
 	attemptTimeout      time.Duration
+	silentClose         bool
 	route               models.Route
 	ids                 identity.RequestIDs
 	zenBody             []byte
@@ -178,6 +179,8 @@ func (body *continuationBody) Close() error {
 	body.cancel(nil)
 	return body.ReadCloser.Close()
 }
+
+func (r *gatewayStreamResumer) SilentClose() bool { return r.silentClose }
 
 func (r *gatewayStreamResumer) ResumeEligible(visibleBytes, reasoningBytes int, toolSeen bool) {
 	if r.meta != nil {

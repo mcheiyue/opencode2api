@@ -273,6 +273,7 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 						streamState:         streamState,
 						continuationTimeout: g.cfg.Performance.StreamContinuationTimeout(),
 						attemptTimeout:      g.cfg.Performance.StreamContinuationAttemptTimeout(),
+						silentClose:         g.cfg.Performance.StreamContinuationSilentClose,
 						route:               upstreamRoute,
 						ids:                 ids,
 						zenBody:             bodies[config.TierZen],

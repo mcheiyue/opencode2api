@@ -136,8 +136,19 @@ func emitUnexpectedStreamError(emitter *bridgeStreamEmitter, cause error) error 
 // truncates this way is Chat-only, and the other protocols' terminals need the
 // per-block bookkeeping this observer does not keep.
 func emitSalvagedToolFinish(w io.Writer, flusher http.Flusher, protocol Protocol, model, responseID string) error {
+	return emitSyntheticFinish(w, flusher, protocol, model, responseID, "tool_calls")
+}
+
+// emitSilentFinish closes a turn the client cannot receive in full with the
+// same terminal a complete turn would send, so the truncation never reaches the
+// client as an error; the caller keeps reporting the failure internally.
+func emitSilentFinish(w io.Writer, flusher http.Flusher, protocol Protocol, model, responseID string) error {
+	return emitSyntheticFinish(w, flusher, protocol, model, responseID, "stop")
+}
+
+func emitSyntheticFinish(w io.Writer, flusher http.Flusher, protocol Protocol, model, responseID, finishReason string) error {
 	if protocol != Chat {
-		return fmt.Errorf("no salvaged tool terminal for %s stream", protocol)
+		return fmt.Errorf("no synthetic terminal for %s stream", protocol)
 	}
 	if responseID == "" {
 		responseID = identity.RandomID("chatcmpl", 12)
@@ -151,7 +162,7 @@ func emitSalvagedToolFinish(w io.Writer, flusher http.Flusher, protocol Protocol
 		"choices": []any{map[string]any{
 			"index":         0,
 			"delta":         map[string]any{},
-			"finish_reason": "tool_calls",
+			"finish_reason": finishReason,
 		}},
 	}); err != nil {
 		return err
@@ -194,6 +205,13 @@ type StreamResumer interface {
 type StreamResumeObserver interface {
 	ResumeEligible(visibleBytes, reasoningBytes int, toolSeen bool)
 	ResumeSkipped(reason string, visibleBytes, reasoningBytes int, toolSeen bool)
+}
+
+// SilentCloser is an optional resumer capability: when it reports true, a turn
+// that cannot be delivered in full ends with an ordinary terminal instead of an
+// in-band error frame.
+type SilentCloser interface {
+	SilentClose() bool
 }
 
 // ForwardStream relays one upstream SSE stream to the client with no resume

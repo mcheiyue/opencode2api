@@ -139,6 +139,10 @@ func ForwardStreamResumable(ctx context.Context, w http.ResponseWriter, reader i
 		if cause == nil {
 			cause = errSSEUnexpectedEOF
 		}
+		if resumerSilentClose(resumer) && emitSilentFinish(w, flusher, protocol, model, observer.ResponseID()) == nil {
+			closeCurrentIfNotFirst(reader, first)
+			return usage, observer.Reported(), fmt.Errorf("closed silently: %w", cause)
+		}
 		emitter := newBridgeStreamEmitter(w, flusher, protocol, model)
 		if err := emitUnexpectedStreamError(emitter, cause); err != nil {
 			closeCurrentIfNotFirst(reader, first)
@@ -160,6 +164,11 @@ func closeCurrentIfNotFirst(reader io.Reader, first io.Reader) {
 	if closer, ok := reader.(io.Closer); ok {
 		_ = closer.Close()
 	}
+}
+
+func resumerSilentClose(resumer StreamResumer) bool {
+	closer, ok := resumer.(SilentCloser)
+	return ok && closer.SilentClose()
 }
 
 func reportResumeSkipped(resumer StreamResumer, reason string, visibleBytes, reasoningBytes int, toolSeen bool) {

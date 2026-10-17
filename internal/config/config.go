@@ -104,6 +104,9 @@ type WebUIConfig struct {
 // StreamContinuationAttemptTimeoutSeconds bounds one continuation attempt, so
 // a wedged exit cannot eat a budget sized for tens of seconds; 0 keeps the
 // global attempt timeout. Valid values are 1 through 86400 seconds.
+// StreamContinuationSilentClose closes a turn the client cannot receive in
+// full with an ordinary terminal chunk instead of an in-band error frame; the
+// failure is still reported to logs and metrics. Opt-in (default false).
 type PerformanceConfig struct {
 	MaxIdleConns                            int  `json:"max_idle_conns"`
 	MaxIdleConnsPerHost                     int  `json:"max_idle_conns_per_host"`
@@ -117,6 +120,7 @@ type PerformanceConfig struct {
 	StreamContinuationMax                   int  `json:"stream_continuation_max"`
 	StreamContinuationTimeoutSeconds        int  `json:"stream_continuation_timeout_seconds"`
 	StreamContinuationAttemptTimeoutSeconds int  `json:"stream_continuation_attempt_timeout_seconds"`
+	StreamContinuationSilentClose           bool `json:"stream_continuation_silent_close"`
 }
 
 // StreamContinuationTimeout bounds one mid-stream continuation fetch. The
@@ -179,7 +183,7 @@ func Load(path string) (Config, error) {
 		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/zen", Go: "https://opencode.ai/zen/go", Anonymous: "https://opencode.ai/inference"},
 		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300},
 		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
-		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15, StreamContinuation: false, StreamContinuationMax: 1, StreamContinuationTimeoutSeconds: 60, StreamContinuationAttemptTimeoutSeconds: 20},
+		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15, StreamContinuation: false, StreamContinuationMax: 1, StreamContinuationTimeoutSeconds: 60, StreamContinuationAttemptTimeoutSeconds: 20, StreamContinuationSilentClose: false},
 		Logging:     LoggingConfig{Level: "info", RingSize: 2000},
 		WebUI:       WebUIConfig{Listen: "0.0.0.0:8081", SessionTTLMinutes: 720},
 		Prefer:      TierGo,

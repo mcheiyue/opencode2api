@@ -63,8 +63,11 @@ type fakeResumer struct {
 	visibleBytes int
 	reasonBytes  int
 	toolSeen     bool
+	silent       bool
 	segment      func(partial string, reasoning string) (io.Reader, error)
 }
+
+func (f *fakeResumer) SilentClose() bool { return f.silent }
 
 func (f *fakeResumer) ResumeSegment(partial string, reasoning string) (io.Reader, error) {
 	f.calls = append(f.calls, partial)
@@ -248,6 +251,23 @@ func TestForwardStreamResumable_toolDeltaBlocksResume(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "upstream_error") {
 		t.Fatalf("expected an in-band error frame, got %q", rec.Body.String())
+	}
+}
+
+func TestForwardStreamResumable_silentCloseEndsTurnWithoutErrorFrame(t *testing.T) {
+	torn := roleFrame() + contentFrame("Hello wor") + tornFragment
+	resumer := &fakeResumer{silent: true}
+	rec := httptest.NewRecorder()
+	_, _, err := ForwardStreamResumable(context.Background(), rec, strings.NewReader(torn), Chat, "test-model", resumer, 1)
+	if err == nil || !strings.Contains(err.Error(), "closed silently") {
+		t.Fatalf("a silently closed turn must still report the failure to telemetry, got %v", err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"finish_reason":"stop"`) || !strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("expected a synthetic terminal chunk, got %q", body)
+	}
+	if strings.Contains(body, "upstream_error") {
+		t.Fatalf("silent close must not write an in-band error frame: %q", body)
 	}
 }
 
