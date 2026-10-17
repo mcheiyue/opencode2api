@@ -31,6 +31,7 @@ func ForwardStreamResumable(ctx context.Context, w http.ResponseWriter, reader i
 	var total Usage
 	first := reader
 	resumes := 0
+	toolArgsTried := false
 	for {
 		_, copyErr := io.Copy(&sseFlushWriter{writer: w, flusher: flusher}, io.TeeReader(reader, observer))
 		// Snapshot the torn tail before Finish clears the frame buffer.
@@ -74,6 +75,45 @@ func ForwardStreamResumable(ctx context.Context, w http.ResponseWriter, reader i
 			if err := emitSalvagedToolFinish(w, flusher, protocol, model, observer.ResponseID()); err == nil {
 				closeCurrentIfNotFirst(reader, first)
 				return usage, observer.Reported(), nil
+			}
+		}
+		// A tool call whose arguments never completed can still be delivered
+		// whole: the rest is fetched from another exit and spliced into the
+		// call the client already holds, so its argument string stays valid.
+		if resumer != nil && resumes < maxResumes && observer.ToolSeen() && !observer.CompleteToolCalls() && !toolArgsTried {
+			toolArgsTried = true
+			if toolArgsResumer, ok := resumer.(ToolArgsResumer); ok && toolArgsResumer.ToolArgsEnabled() {
+				request, single := observer.PendingToolCall()
+				closeObject, partial, recoverable := false, "", false
+				if single {
+					closeObject, partial, recoverable = toolArgsShape(request.Raw)
+				}
+				switch {
+				case !single:
+					reportResumeSkipped(resumer, "tool_args_multi_call", observer.visibleBytes, observer.reasoningBytes, observer.toolSeen)
+				case !recoverable:
+					reportResumeSkipped(resumer, "tool_args_unrecoverable", observer.visibleBytes, observer.reasoningBytes, observer.toolSeen)
+				default:
+					request.Partial = partial
+					if terminator := missingRecordTerminator(tornTail); len(terminator) > 0 {
+						if _, err := w.Write(terminator); err != nil {
+							return usage, observer.Reported(), err
+						}
+						flusher.Flush()
+					}
+					next, err := resumeToolArgsWithPing(ctx, w, flusher, toolArgsResumer, request)
+					if err == nil {
+						closeCurrentIfNotFirst(reader, first)
+						observer.parseErr = nil
+						reader = newToolArgsSpliceReader(next, observer.ResponseID(), model, request, closeObject)
+						resumes++
+						continue
+					}
+					if ClientCanceled(ctx, err) {
+						closeCurrentIfNotFirst(reader, first)
+						return usage, observer.Reported(), err
+					}
+				}
 			}
 		}
 		// Unexpected termination — the only resume window.
@@ -206,6 +246,20 @@ func missingRecordTerminator(tail []byte) []byte {
 // the fetch. The goroutine is fully stopped before returning, so no ping can
 // be written after the next frames start flowing.
 func resumeWithPing(ctx context.Context, w io.Writer, flusher http.Flusher, resumer StreamResumer, partial string, reasoning string) (io.Reader, error) {
+	return fetchWithPing(w, flusher, func() (io.Reader, error) {
+		return resumer.ResumeSegment(partial, reasoning)
+	})
+}
+
+// resumeToolArgsWithPing fetches the rest of a tool call's arguments under the
+// same keepalive regime as a text continuation.
+func resumeToolArgsWithPing(ctx context.Context, w io.Writer, flusher http.Flusher, resumer ToolArgsResumer, request ToolArgsRequest) (io.Reader, error) {
+	return fetchWithPing(w, flusher, func() (io.Reader, error) {
+		return resumer.ResumeToolArgs(request)
+	})
+}
+
+func fetchWithPing(w io.Writer, flusher http.Flusher, fetch func() (io.Reader, error)) (io.Reader, error) {
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -224,7 +278,7 @@ func resumeWithPing(ctx context.Context, w io.Writer, flusher http.Flusher, resu
 			}
 		}
 	}()
-	reader, err := resumer.ResumeSegment(partial, reasoning)
+	reader, err := fetch()
 	close(stop)
 	<-done
 	return reader, err

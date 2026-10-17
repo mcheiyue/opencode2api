@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -214,6 +215,24 @@ type SilentCloser interface {
 	SilentClose() bool
 }
 
+// ToolArgsRequest is a tool call whose arguments were still arriving when the
+// upstream stream died. Partial is the recovered prefix of the string value the
+// model was writing; it is empty when no argument byte arrived at all.
+type ToolArgsRequest struct {
+	Index   int
+	CallID  string
+	Name    string
+	Raw     string
+	Partial string
+}
+
+// ToolArgsResumer is an optional resumer capability: fetch the rest of a tool
+// call's arguments on another exit.
+type ToolArgsResumer interface {
+	ToolArgsEnabled() bool
+	ResumeToolArgs(req ToolArgsRequest) (io.Reader, error)
+}
+
 // ForwardStream relays one upstream SSE stream to the client with no resume
 // support; it is the thin wrapper that pins the historical behavior.
 func ForwardStream(ctx context.Context, w http.ResponseWriter, reader io.Reader, protocol Protocol, model string) (Usage, bool, error) {
@@ -244,6 +263,7 @@ type streamUsageObserver struct {
 	// continuation lane is Chat-only), so other protocols pay nothing.
 	trackTools     bool
 	toolNames      map[string]string
+	toolIDs        map[string]string
 	toolArgs       map[string]*strings.Builder
 	toolOrder      []string
 	responseID     string
@@ -267,6 +287,7 @@ func newStreamUsageObserver(protocol Protocol) *streamUsageObserver {
 		},
 		trackTools: protocol == Chat,
 		toolNames:  map[string]string{},
+		toolIDs:    map[string]string{},
 		toolArgs:   map[string]*strings.Builder{},
 	}
 }
@@ -328,6 +349,26 @@ func (observer *streamUsageObserver) ReasoningRunes() int {
 // ToolSeen reports whether any tool call delta appeared; a stream broken
 // inside a tool call must never be resumed as plain text.
 func (observer *streamUsageObserver) ToolSeen() bool { return observer.toolSeen }
+
+// PendingToolCall reports the one tool call whose arguments never completed.
+// ok is false when the stream carried no call, more than one, or a call whose
+// key is not a usable index: argument fragments can only be spliced back onto a
+// single unambiguously identified call.
+func (observer *streamUsageObserver) PendingToolCall() (ToolArgsRequest, bool) {
+	if !observer.toolSeen || len(observer.toolOrder) != 1 {
+		return ToolArgsRequest{}, false
+	}
+	key := observer.toolOrder[0]
+	index, err := strconv.Atoi(key)
+	if err != nil || index < 0 {
+		return ToolArgsRequest{}, false
+	}
+	request := ToolArgsRequest{Index: index, CallID: observer.toolIDs[key], Name: observer.toolNames[key]}
+	if builder := observer.toolArgs[key]; builder != nil {
+		request.Raw = builder.String()
+	}
+	return request, true
+}
 
 // ResponseID is the id the upstream announced for this stream, so a synthetic
 // terminal chunk carries the same id as the frames it closes.
@@ -471,6 +512,9 @@ func (observer *streamUsageObserver) consume(frame []byte) {
 			case "tool_start", "tool_delta":
 				observer.toolSeen = true
 				if observer.trackTools {
+					if event.ToolID != "" {
+						observer.toolIDs[event.ToolKey] = event.ToolID
+					}
 					builder := observer.noteTool(event.ToolKey, event.ToolName)
 					if event.Kind == "tool_delta" && builder != nil && event.Text != "" && builder.Len() < maxToolArgumentsBytes {
 						builder.WriteString(event.Text)

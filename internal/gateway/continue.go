@@ -14,6 +14,7 @@ import (
 	"opencode2api/internal/httpx"
 	"opencode2api/internal/identity"
 	"opencode2api/internal/models"
+	wire "opencode2api/internal/protocol"
 	"opencode2api/internal/telemetry"
 )
 
@@ -27,6 +28,10 @@ const reasoningContinuationInstruction = "You have already completed the followi
 
 const maxContinuationPartialBytes = 512 << 10
 
+const toolArgsFullInstruction = "Your previous response was cut off before you finished calling the tool %q. Call that tool now: output only the arguments object for it, as a single JSON object starting with { and ending with }, with no explanation, no markdown fences and no other text."
+
+const toolArgsContinueInstruction = "以下是正在写入的文档已完成的部分，它在中间被截断了：\n\n<<<PARTIAL>>>\n%s\n<<<END>>>\n\n请从中断处原样继续输出剩余原文。只输出剩余部分：不要重复已有内容、不要任何解释、不要 JSON 或代码块包装。"
+
 var errContinuationTimeout = errors.New("stream continuation fetch timed out")
 
 type gatewayStreamResumer struct {
@@ -36,6 +41,7 @@ type gatewayStreamResumer struct {
 	continuationTimeout time.Duration
 	attemptTimeout      time.Duration
 	silentClose         bool
+	toolArgs            bool
 	route               models.Route
 	ids                 identity.RequestIDs
 	zenBody             []byte
@@ -58,23 +64,62 @@ func (r *gatewayStreamResumer) ResumeSegment(partial string, reasoning string) (
 	if len(reasoning) > maxContinuationPartialBytes {
 		reasoning = reasoning[len(reasoning)-maxContinuationPartialBytes:]
 	}
-	if r.clientCtx == nil {
-		r.recordResumeFailure("missing_client_context")
-		return nil, errors.New("stream continuation requires a client context")
-	}
-	if err := r.clientCtx.Err(); err != nil {
-		r.recordResumeSkipped("client_canceled", len(partial), len(reasoning), false)
+	if err := r.readyForContinuation(len(partial), len(reasoning), false); err != nil {
 		return nil, err
-	}
-	if r.continuationTimeout <= 0 {
-		r.recordResumeSkipped("budget_disabled", len(partial), len(reasoning), false)
-		return nil, errors.New("stream continuation budget is disabled")
 	}
 	requestBody, err := buildContinuationBody(r.zenBody, partial, reasoning)
 	if err != nil {
 		r.recordResumeFailure("invalid_continuation_body")
 		return nil, err
 	}
+	kind := "reasoning"
+	if partial != "" {
+		kind = "text"
+	}
+	return r.fetchContinuation(requestBody, kind, len(partial), len(reasoning))
+}
+
+// ResumeToolArgs fetches the rest of a tool call's arguments so the call the
+// client already holds can be finished instead of dropped.
+func (r *gatewayStreamResumer) ResumeToolArgs(request wire.ToolArgsRequest) (io.Reader, error) {
+	if !r.toolArgs {
+		r.recordResumeSkipped("tool_args_disabled", 0, 0, true)
+		return nil, errors.New("tool arguments continuation is disabled")
+	}
+	if err := r.readyForContinuation(0, 0, true); err != nil {
+		return nil, err
+	}
+	requestBody, err := buildToolArgsBody(r.zenBody, request)
+	if err != nil {
+		r.recordResumeFailure("invalid_continuation_body")
+		return nil, err
+	}
+	kind := "tool_args_full"
+	if request.Partial != "" {
+		kind = "tool_args_continue"
+	}
+	return r.fetchContinuation(requestBody, kind, len(request.Partial), 0)
+}
+
+// readyForContinuation holds the guards every continuation shares: a live
+// client context and a positive budget.
+func (r *gatewayStreamResumer) readyForContinuation(partialBytes, reasoningBytes int, toolSeen bool) error {
+	if r.clientCtx == nil {
+		r.recordResumeFailure("missing_client_context")
+		return errors.New("stream continuation requires a client context")
+	}
+	if err := r.clientCtx.Err(); err != nil {
+		r.recordResumeSkipped("client_canceled", partialBytes, reasoningBytes, toolSeen)
+		return err
+	}
+	if r.continuationTimeout <= 0 {
+		r.recordResumeSkipped("budget_disabled", partialBytes, reasoningBytes, toolSeen)
+		return errors.New("stream continuation budget is disabled")
+	}
+	return nil
+}
+
+func (r *gatewayStreamResumer) fetchContinuation(requestBody []byte, kind string, partialBytes, reasoningBytes int) (io.Reader, error) {
 	continuationCtx, cancel := context.WithCancelCause(r.clientCtx)
 	continuationCtx = context.WithValue(continuationCtx, anonymousStreamStateKey{}, r.streamState)
 	continuationCtx = withContinuationAttemptTimeout(continuationCtx, r.attemptTimeout)
@@ -98,18 +143,10 @@ func (r *gatewayStreamResumer) ResumeSegment(partial string, reasoning string) (
 	bodies := map[config.Tier][]byte{config.TierZen: requestBody}
 	if r.meta != nil {
 		r.meta.ResumeAttempts++
-		if partial != "" {
-			r.meta.ResumeKind = "text"
-		} else {
-			r.meta.ResumeKind = "reasoning"
-		}
+		r.meta.ResumeKind = kind
 	}
 	if r.g.logger != nil {
-		kind := ""
-		if r.meta != nil {
-			kind = r.meta.ResumeKind
-		}
-		r.g.logger.Info("stream continuation attempt dispatched", "component", "upstream", "event", "stream_continuation_attempted", "request_id", r.ids.Request, "model", r.route.ID, "partial_bytes", len(partial), "reasoning_bytes", len(reasoning), "resume_kind", kind, "timeout_ms", r.continuationTimeout.Milliseconds(), "attempt_timeout_ms", r.attemptTimeout.Milliseconds())
+		r.g.logger.Info("stream continuation attempt dispatched", "component", "upstream", "event", "stream_continuation_attempted", "request_id", r.ids.Request, "model", r.route.ID, "partial_bytes", partialBytes, "reasoning_bytes", reasoningBytes, "resume_kind", kind, "timeout_ms", r.continuationTimeout.Milliseconds(), "attempt_timeout_ms", r.attemptTimeout.Milliseconds())
 	}
 	resp, err, attempts := r.g.doAnonymousUpstream(continuationCtx, r.route, bodies, r.ids, r.attemptOffset)
 	r.attemptOffset += attempts
@@ -161,11 +198,7 @@ func (r *gatewayStreamResumer) ResumeSegment(partial string, reasoning string) (
 	}
 	keepContext = true
 	if r.g.logger != nil {
-		kind := ""
-		if r.meta != nil {
-			kind = r.meta.ResumeKind
-		}
-		r.g.logger.Info("stream continued on a new exit", "component", "upstream", "event", "stream_continued", "request_id", r.ids.Request, "model", r.route.ID, "partial_bytes", len(partial), "reasoning_bytes", len(reasoning), "resume_kind", kind, "resume_attempt", continued)
+		r.g.logger.Info("stream continued on a new exit", "component", "upstream", "event", "stream_continued", "request_id", r.ids.Request, "model", r.route.ID, "partial_bytes", partialBytes, "reasoning_bytes", reasoningBytes, "resume_kind", kind, "resume_attempt", continued)
 	}
 	return &continuationBody{ReadCloser: resp.Body, cancel: cancel}, nil
 }
@@ -179,6 +212,8 @@ func (body *continuationBody) Close() error {
 	body.cancel(nil)
 	return body.ReadCloser.Close()
 }
+
+func (r *gatewayStreamResumer) ToolArgsEnabled() bool { return r.toolArgs }
 
 func (r *gatewayStreamResumer) SilentClose() bool { return r.silentClose }
 
@@ -265,6 +300,30 @@ func buildContinuationBody(zenBody []byte, partial string, reasoning string) ([]
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return nil, errors.New("continuation body contains unsupported JSON values")
+	}
+	return encoded, nil
+}
+
+// buildToolArgsBody appends the instruction that makes the model finish the
+// arguments it was still writing; the recovered prefix is inlined when there is
+// one, because the free tier has no assistant prefill to continue from.
+func buildToolArgsBody(zenBody []byte, request wire.ToolArgsRequest) ([]byte, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(zenBody, &payload); err != nil {
+		return nil, fmt.Errorf("parse tool arguments base body: %w", err)
+	}
+	messages, ok := payload["messages"].([]any)
+	if !ok || len(messages) == 0 {
+		return nil, errors.New("tool arguments base body has no messages")
+	}
+	instruction := fmt.Sprintf(toolArgsFullInstruction, request.Name)
+	if request.Partial != "" {
+		instruction = fmt.Sprintf(toolArgsContinueInstruction, request.Partial)
+	}
+	payload["messages"] = append(messages, map[string]any{"role": "user", "content": instruction})
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, errors.New("tool arguments body contains unsupported JSON values")
 	}
 	return encoded, nil
 }

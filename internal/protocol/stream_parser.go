@@ -88,11 +88,14 @@ func (parser *bridgeStreamParser) parseChatEvent(eventName string, value map[str
 			if name := jsonutil.StringAt(function, "name"); name != "" {
 				parser.toolNames[key] = mergeToolName(parser.toolNames[key], name)
 			}
-			if arguments := jsonutil.StringAt(function, "arguments"); arguments != "" {
-				if !parser.tools[key] && parser.toolNames[key] != "" {
-					parser.tools[key] = true
-					events = append(events, bridgeStreamEvent{Kind: "tool_start", ToolKey: key, ToolID: parser.toolIDs[key], ToolName: parser.toolNames[key]})
-				}
+			arguments := jsonutil.StringAt(function, "arguments")
+			if !parser.tools[key] && parser.toolNames[key] != "" {
+				// A named call is a tool call before its arguments arrive, so a
+				// stream that dies in between is still observed as one.
+				parser.tools[key] = true
+				events = append(events, bridgeStreamEvent{Kind: "tool_start", ToolKey: key, ToolID: parser.toolIDs[key], ToolName: parser.toolNames[key]})
+			}
+			if arguments != "" {
 				events = append(events, bridgeStreamEvent{Kind: "tool_delta", ToolKey: key, ToolID: parser.toolIDs[key], ToolName: parser.toolNames[key], Text: arguments})
 			}
 		}
