@@ -133,16 +133,26 @@ func (g *Gateway) authenticate(next http.HandlerFunc) http.HandlerFunc {
 			wire.WriteError(w, protocol, http.StatusUnauthorized, "invalid local API key", "authentication_error", "")
 			return
 		}
-		if meta := telemetry.MetaFromRequest(r); meta != nil {
-			// The Playground borrows the first enabled key to pass this check, so
-			// its traffic gets its own bucket instead of being billed to that key.
-			meta.ServerKeyID = config.Fingerprint(matched)
-			if isDiagnosticRequest(r.Context()) {
-				meta.ServerKeyID = telemetry.PlaygroundServerKey
-			}
+		// The Playground borrows the first enabled key to pass this check, so
+		// its traffic gets its own bucket instead of being billed to that key.
+		caller := config.Fingerprint(matched)
+		if isDiagnosticRequest(r.Context()) {
+			caller = telemetry.PlaygroundServerKey
 		}
-		next(w, r)
+		if meta := telemetry.MetaFromRequest(r); meta != nil {
+			meta.ServerKeyID = caller
+		}
+		next(w, r.WithContext(context.WithValue(r.Context(), callerContextKey{}, caller)))
 	}
+}
+
+type callerContextKey struct{}
+
+// callerScope returns the authenticated caller that request identities are
+// scoped to, so different server keys never share an upstream session.
+func callerScope(ctx context.Context) string {
+	caller, _ := ctx.Value(callerContextKey{}).(string)
+	return caller
 }
 
 func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
@@ -206,7 +216,7 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			wire.WriteError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
 			return
 		}
-		ids := identity.DeriveRequestIDs(r, payload)
+		ids := identity.DeriveRequestIDs(r, payload, callerScope(r.Context()))
 		if meta != nil {
 			meta.Request = ids.Request
 			meta.Session = ids.Session
@@ -406,7 +416,7 @@ func (g *Gateway) forwardSystemOne(w http.ResponseWriter, r *http.Request, body 
 	for _, tier := range route.KeyTiers {
 		bodies[tier] = body
 	}
-	ids := identity.DeriveRequestIDs(r, payload)
+	ids := identity.DeriveRequestIDs(r, payload, callerScope(r.Context()))
 	if meta != nil {
 		meta.Request = ids.Request
 		meta.Session = ids.Session
