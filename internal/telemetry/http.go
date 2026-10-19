@@ -11,6 +11,9 @@ import (
 	"opencode2api/internal/protocol"
 )
 
+// RequestMeta is the request-local trace that Middleware attaches to a request
+// and the gateway fills in while it routes, retries and streams it. Metrics and
+// the request log read it once the handler returns.
 type RequestMeta struct {
 	ModelAlias string
 	Model      string
@@ -36,10 +39,15 @@ type RequestMeta struct {
 	// upstream account that served the request.
 	ServerKeyID string
 	// Shaped marks a key-tier free-model request whose wire body was
-	// normalized to agent shape (stream + core tools) like the anonymous
+	// normalized to agent shape (stream + required tools) like the anonymous
 	// lane. Non-streaming responses for shaped requests arrive as SSE
 	// and must be collapsed like anonymous ones.
-	Shaped         bool
+	Shaped bool
+	// ToolAlias holds the client's original read-related tool name (e.g.
+	// "reAd" or "read_file") when the v1 lane's shaper renamed it to "read"
+	// on the outbound wire. When non-empty, "read" tool calls in the
+	// upstream response are rewritten back to ToolAlias before returning.
+	ToolAlias      string
 	Usage          protocol.Usage
 	UsageReported  bool
 	AttemptOutcome string
@@ -78,10 +86,15 @@ func MetaFromContext(ctx context.Context) *RequestMeta {
 	return meta
 }
 
+// MetaFromRequest returns the request-local trace of r, or nil when it is
+// absent.
 func MetaFromRequest(r *http.Request) *RequestMeta {
 	return MetaFromContext(r.Context())
 }
 
+// statusWriter records the status and body size of a response. Only the first
+// WriteHeader reaches the underlying writer, and a Write without one implies
+// 200.
 type statusWriter struct {
 	http.ResponseWriter
 	status int
@@ -111,7 +124,12 @@ func (w *statusWriter) Flush() {
 
 func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
-func Middleware(monitor *Monitor, logger *slog.Logger, next http.Handler) http.Handler {
+// Middleware counts active requests and attaches a RequestMeta to every
+// request, reusing one that is already present. When the handler returns it
+// records the request in monitor and logs it: at info level when it was routed
+// to an upstream channel, and always at debug level. /healthz bypasses all of
+// it.
+func Middleware(monitor *Metrics, logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" {
 			next.ServeHTTP(w, r)

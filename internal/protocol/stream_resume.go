@@ -20,7 +20,7 @@ func ForwardStreamResumable(ctx context.Context, w http.ResponseWriter, reader i
 	if !ok {
 		return Usage{}, false, fmt.Errorf("response writer does not support streaming")
 	}
-	observer := newStreamUsageObserver(protocol)
+	observer := streamUsageObserver(protocol)
 	observer.trackContent = resumer != nil
 	// Per-segment accounting: the continuation request replays the partial
 	// as prompt, so its reported Input would inflate the true first-segment
@@ -183,7 +183,7 @@ func ForwardStreamResumable(ctx context.Context, w http.ResponseWriter, reader i
 			closeCurrentIfNotFirst(reader, first)
 			return usage, observer.Reported(), fmt.Errorf("closed silently: %w", cause)
 		}
-		emitter := newBridgeStreamEmitter(w, flusher, protocol, model)
+		emitter := bridgeStreamEmitter(w, flusher, protocol, model)
 		if err := emitUnexpectedStreamError(emitter, cause); err != nil {
 			closeCurrentIfNotFirst(reader, first)
 			return usage, observer.Reported(), err

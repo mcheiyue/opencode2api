@@ -497,7 +497,7 @@ func TestLongestOverlap(t *testing.T) {
 }
 
 func TestObserverTextAccumulation(t *testing.T) {
-	observer := newStreamUsageObserver(Chat)
+	observer := streamUsageObserver(Chat)
 	observer.trackContent = true
 	frame := roleFrame() + contentFrame("Hello")
 	if _, err := observer.Write([]byte(frame)); err != nil {
@@ -519,7 +519,7 @@ func TestObserverTextAccumulation(t *testing.T) {
 }
 
 func TestObserverTrackContentDisabledSkipsCopies(t *testing.T) {
-	observer := newStreamUsageObserver(Chat)
+	observer := streamUsageObserver(Chat)
 	frame := roleFrame() + contentFrame("Hello")
 	if _, err := observer.Write([]byte(frame)); err != nil {
 		t.Fatalf("write: %v", err)
@@ -607,7 +607,7 @@ func TestContinuationFrameFilter_keepsFinishAndUsage(t *testing.T) {
 }
 
 func TestObserverCarriesUpstreamErrorDetail(t *testing.T) {
-	observer := newStreamUsageObserver(Chat)
+	observer := streamUsageObserver(Chat)
 	observer.trackContent = true
 	errorFrame := `data: {"error":{"message":"free tier rate limited","type":"rate_limit_error"}}` + "\n\n"
 	if _, err := observer.Write([]byte(errorFrame)); err != nil {
@@ -626,14 +626,14 @@ func TestObserverCarriesUpstreamErrorDetail(t *testing.T) {
 }
 
 func TestObserverUpstreamErrorDefaultsToSentinel(t *testing.T) {
-	observer := newStreamUsageObserver(Chat)
+	observer := streamUsageObserver(Chat)
 	if got := observer.UpstreamError(); got.Error() != errStreamUpstreamFailure.Error() {
 		t.Fatalf("observer without an error frame must return the bare sentinel: %v", got)
 	}
 }
 
 func TestObserverCompleteToolCalls(t *testing.T) {
-	complete := newStreamUsageObserver(Chat)
+	complete := streamUsageObserver(Chat)
 	if _, err := complete.Write([]byte(roleFrame() + completeToolCallFrame())); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -642,7 +642,7 @@ func TestObserverCompleteToolCalls(t *testing.T) {
 		t.Fatal("CompleteToolCalls() = false for a fully delivered tool call")
 	}
 
-	partial := newStreamUsageObserver(Chat)
+	partial := streamUsageObserver(Chat)
 	if _, err := partial.Write([]byte(roleFrame() + toolCallFrame())); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -654,7 +654,7 @@ func TestObserverCompleteToolCalls(t *testing.T) {
 	namelessFrame := chatFrame(map[string]any{"tool_calls": []any{map[string]any{
 		"index": 0, "id": "call_1", "function": map[string]any{"arguments": `{"cmd":"ls"}`},
 	}}})
-	nameless := newStreamUsageObserver(Chat)
+	nameless := streamUsageObserver(Chat)
 	if _, err := nameless.Write([]byte(roleFrame() + namelessFrame)); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -663,7 +663,7 @@ func TestObserverCompleteToolCalls(t *testing.T) {
 		t.Fatal("CompleteToolCalls() = true for a tool call without a name")
 	}
 
-	none := newStreamUsageObserver(Chat)
+	none := streamUsageObserver(Chat)
 	if _, err := none.Write([]byte(roleFrame() + contentFrame("hello"))); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -713,7 +713,7 @@ func TestForwardStreamResumable_partialSiblingToolCallStillFails(t *testing.T) {
 }
 
 func TestObserverToolState(t *testing.T) {
-	complete := newStreamUsageObserver(Chat)
+	complete := streamUsageObserver(Chat)
 	if _, err := complete.Write([]byte(roleFrame() + completeToolCallFrame())); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -722,7 +722,7 @@ func TestObserverToolState(t *testing.T) {
 		t.Fatalf("ToolState() = %q for a complete call", state)
 	}
 
-	truncated := newStreamUsageObserver(Chat)
+	truncated := streamUsageObserver(Chat)
 	if _, err := truncated.Write([]byte(roleFrame() + toolCallFrame())); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -736,7 +736,7 @@ func TestObserverToolState(t *testing.T) {
 	keyless := chatFrame(map[string]any{"tool_calls": []any{map[string]any{
 		"type": "function", "function": map[string]any{"name": "bash", "arguments": `{"cmd":"ls"}`},
 	}}})
-	unkeyed := newStreamUsageObserver(Chat)
+	unkeyed := streamUsageObserver(Chat)
 	if _, err := unkeyed.Write([]byte(roleFrame() + keyless)); err != nil {
 		t.Fatalf("write: %v", err)
 	}

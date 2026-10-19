@@ -241,11 +241,11 @@ func TestResumeSegmentUsesClientContextAfterInitialBudgetExpires(t *testing.T) {
 		IdleConnTimeoutSeconds: 10, FailureCooldownSeconds: 30,
 		FirstEventTimeoutSeconds: 2, StreamContinuationTimeoutSeconds: 2,
 	}
-	transports, err := newTransportPool([]string{"direct", "direct"}, performance, time.Second)
+	transports, err := transportPool([]string{"direct", "direct"}, performance, time.Second)
 	if err != nil {
-		t.Fatalf("newTransportPool: %v", err)
+		t.Fatalf("transportPool: %v", err)
 	}
-	pool := newAnonymousPool(true, transports, 30*time.Second)
+	pool := anonymousPool(true, transports, 30*time.Second)
 	ids := identity.RequestIDs{Session: "ses_test", Request: "req_test"}
 	startNode := pool.CursorFor(ids.Session).start
 	state := &anonymousStreamState{node: pool.nodes[startNode]}
@@ -264,6 +264,7 @@ func TestResumeSegmentUsesClientContextAfterInitialBudgetExpires(t *testing.T) {
 			Performance: performance,
 		},
 		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		catalog:   models.Catalog(config.TierZen, nil),
 		anonymous: pool,
 	}
 	resumer := &gatewayStreamResumer{
@@ -317,14 +318,15 @@ func TestResumeSegmentTimeoutCancelsBeforeFirstEvent(t *testing.T) {
 		IdleConnTimeoutSeconds: 10, FailureCooldownSeconds: 1,
 		FirstEventTimeoutSeconds: 0, StreamContinuationTimeoutSeconds: 50,
 	}
-	transports, err := newTransportPool([]string{"direct"}, performance, 0)
+	transports, err := transportPool([]string{"direct"}, performance, 0)
 	if err != nil {
-		t.Fatalf("newTransportPool: %v", err)
+		t.Fatalf("transportPool: %v", err)
 	}
 	g := &Gateway{
 		cfg:       config.Config{Anonymous: true, Upstream: config.UpstreamConfig{Zen: server.URL, Anonymous: server.URL}, Performance: performance},
 		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		anonymous: newAnonymousPool(true, transports, time.Second),
+		catalog:   models.Catalog(config.TierZen, nil),
+		anonymous: anonymousPool(true, transports, time.Second),
 	}
 	meta := &telemetry.RequestMeta{}
 	resumer := &gatewayStreamResumer{
@@ -366,15 +368,16 @@ func TestResumeSegmentStopsBudgetAfterFirstEvent(t *testing.T) {
 		IdleConnTimeoutSeconds: 10, FailureCooldownSeconds: 1,
 		FirstEventTimeoutSeconds: 1, StreamContinuationTimeoutSeconds: 1,
 	}
-	transports, err := newTransportPool([]string{"direct"}, performance, 0)
+	transports, err := transportPool([]string{"direct"}, performance, 0)
 	if err != nil {
-		t.Fatalf("newTransportPool: %v", err)
+		t.Fatalf("transportPool: %v", err)
 	}
 	meta := &telemetry.RequestMeta{}
 	g := &Gateway{
 		cfg:       config.Config{Anonymous: true, Upstream: config.UpstreamConfig{Zen: server.URL, Anonymous: server.URL}, Performance: performance},
 		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		anonymous: newAnonymousPool(true, transports, time.Second),
+		catalog:   models.Catalog(config.TierZen, nil),
+		anonymous: anonymousPool(true, transports, time.Second),
 	}
 	resumer := &gatewayStreamResumer{
 		g: g, clientCtx: context.Background(), continuationTimeout: 500 * time.Millisecond,
@@ -470,15 +473,16 @@ func TestResumeSegmentBoundsEachContinuationAttempt(t *testing.T) {
 		IdleConnTimeoutSeconds: 10, FailureCooldownSeconds: 1,
 		FirstEventTimeoutSeconds: 0, StreamContinuationTimeoutSeconds: 5,
 	}
-	transports, err := newTransportPool([]string{"direct", "direct"}, performance, 0)
+	transports, err := transportPool([]string{"direct", "direct"}, performance, 0)
 	if err != nil {
-		t.Fatalf("newTransportPool: %v", err)
+		t.Fatalf("transportPool: %v", err)
 	}
 	meta := &telemetry.RequestMeta{}
 	g := &Gateway{
 		cfg:       config.Config{Anonymous: true, Upstream: config.UpstreamConfig{Zen: server.URL, Anonymous: server.URL}, Performance: performance},
 		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		anonymous: newAnonymousPool(true, transports, time.Second),
+		catalog:   models.Catalog(config.TierZen, nil),
+		anonymous: anonymousPool(true, transports, time.Second),
 	}
 	resumer := &gatewayStreamResumer{
 		g: g, clientCtx: context.Background(),

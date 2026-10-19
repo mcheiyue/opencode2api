@@ -107,7 +107,7 @@ func escapeJSONFragment(text string) (string, error) {
 // and terminates the turn.
 type toolArgsSpliceReader struct {
 	source      io.Reader
-	probe       *streamUsageObserver
+	probe       *streamUsageTracker
 	responseID  string
 	model       string
 	request     ToolArgsRequest
@@ -121,7 +121,7 @@ type toolArgsSpliceReader struct {
 }
 
 func newToolArgsSpliceReader(source io.Reader, responseID, model string, request ToolArgsRequest, closeObject bool) io.Reader {
-	probe := newStreamUsageObserver(Chat)
+	probe := streamUsageObserver(Chat)
 	probe.trackContent = true
 	splice := &toolArgsSpliceReader{
 		probe:       probe,

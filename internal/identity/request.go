@@ -1,11 +1,11 @@
 // Package identity derives stable session identities.
 //
 // The 2026-10-14 Zen free-tier gate validates a descending-timestamp session
-// id plus a client User-Agent, and it 403s requests that still carry the
-// legacy x-opencode-request header. The identity that matters upstream is
-// therefore the pair (x-opencode-session, x-opencode-session-id): Session is
-// the conversation-affinity key and must keep the descending layout minted by
-// CanonicalSessionID.
+// id plus a client User-Agent, and the /inference gate 403s requests that
+// carry the v1 lane's x-opencode-request header. The identity that matters
+// upstream is therefore the pair (x-opencode-session, x-opencode-session-id):
+// Session is the conversation-affinity key and must keep the descending layout
+// minted by CanonicalSessionID.
 package identity
 
 import (
@@ -22,14 +22,15 @@ import (
 )
 
 // RequestIDs carries the identity headers the upstream free tier inspects.
-// Session is sent as x-opencode-session on every lane and additionally as
-// x-opencode-session-id on /inference, which requires both. Request travels as
-// x-opencode-request on the legacy /zen/v1 lane only; /inference rejects it.
-// Project is rendered per lane by the gateway (prj_* on /zen/v1, bare 40-hex
-// on /inference).
+// Session is sent as both x-opencode-session and x-opencode-session-id.
+// Message is the user message id the v1 lane receives as x-opencode-request;
+// the v2 lane rejects that header. Request only identifies the request inside
+// the gateway. Project is rendered per lane by the gateway (prj_* on the v1
+// lane, bare 40-hex on the v2 lane).
 type RequestIDs struct {
 	Session       string
 	Request       string
+	Message       string
 	Project       string
 	ParentSession string
 }
@@ -83,6 +84,7 @@ func DeriveRequestIDs(r *http.Request, body map[string]any, scope string) Reques
 	return RequestIDs{
 		Session:       session,
 		Request:       RandomID("req", 16),
+		Message:       UserMessageID(r, body, session),
 		Project:       projectSignal,
 		ParentSession: parentSession,
 	}
@@ -170,11 +172,6 @@ func firstUserTurn(body map[string]any, prelude *[]any) (any, bool) {
 	return nil, false
 }
 
-func StableID(prefix, value string) string {
-	sum := sha256.Sum256([]byte(prefix + "\x00" + value))
-	return prefix + "_" + hex.EncodeToString(sum[:12])
-}
-
 // canonicalSessionPattern matches OpenCode's canonical session format:
 // "ses_" + 12 lowercase hex timestamp characters + 14 Base62 characters.
 // Since 2026-09-16 the Zen free tier rejects any other session shape with
@@ -233,6 +230,8 @@ func descendingTimePart(hash []byte) string {
 	})
 }
 
+// base62Fixed renders n in the Base62 alphabet, zero-padded to width
+// characters. It consumes n.
 func base62Fixed(n *big.Int, width int) string {
 	base := big.NewInt(62)
 	out := make([]byte, width)
@@ -244,6 +243,8 @@ func base62Fixed(n *big.Int, width int) string {
 	return string(out)
 }
 
+// RandomID returns prefix + "_" + size random bytes in hex. It panics when the
+// system random source fails.
 func RandomID(prefix string, size int) string {
 	buf := make([]byte, size)
 	if _, err := rand.Read(buf); err != nil {
