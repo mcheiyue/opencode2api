@@ -245,7 +245,7 @@ func TestResumeSegmentUsesClientContextAfterInitialBudgetExpires(t *testing.T) {
 	if err != nil {
 		t.Fatalf("transportPool: %v", err)
 	}
-	pool := anonymousPool(true, transports, 30*time.Second)
+	pool := anonymousPool(true, transports, 30*time.Second, anonymousBackoff{})
 	ids := identity.RequestIDs{Session: "ses_test", Request: "req_test"}
 	startNode := pool.CursorFor(ids.Session).start
 	state := &anonymousStreamState{node: pool.nodes[startNode]}
@@ -326,7 +326,7 @@ func TestResumeSegmentTimeoutCancelsBeforeFirstEvent(t *testing.T) {
 		cfg:       config.Config{Anonymous: true, Upstream: config.UpstreamConfig{Zen: server.URL, Anonymous: server.URL}, Performance: performance},
 		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 		catalog:   models.Catalog(config.TierZen, nil),
-		anonymous: anonymousPool(true, transports, time.Second),
+		anonymous: anonymousPool(true, transports, time.Second, anonymousBackoff{}),
 	}
 	meta := &telemetry.RequestMeta{}
 	resumer := &gatewayStreamResumer{
@@ -377,7 +377,7 @@ func TestResumeSegmentStopsBudgetAfterFirstEvent(t *testing.T) {
 		cfg:       config.Config{Anonymous: true, Upstream: config.UpstreamConfig{Zen: server.URL, Anonymous: server.URL}, Performance: performance},
 		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 		catalog:   models.Catalog(config.TierZen, nil),
-		anonymous: anonymousPool(true, transports, time.Second),
+		anonymous: anonymousPool(true, transports, time.Second, anonymousBackoff{}),
 	}
 	resumer := &gatewayStreamResumer{
 		g: g, clientCtx: context.Background(), continuationTimeout: 500 * time.Millisecond,
@@ -482,7 +482,7 @@ func TestResumeSegmentBoundsEachContinuationAttempt(t *testing.T) {
 		cfg:       config.Config{Anonymous: true, Upstream: config.UpstreamConfig{Zen: server.URL, Anonymous: server.URL}, Performance: performance},
 		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 		catalog:   models.Catalog(config.TierZen, nil),
-		anonymous: anonymousPool(true, transports, time.Second),
+		anonymous: anonymousPool(true, transports, time.Second, anonymousBackoff{}),
 	}
 	resumer := &gatewayStreamResumer{
 		g: g, clientCtx: context.Background(),
