@@ -217,14 +217,14 @@ func (g *Gateway) rotationAttempt(parent context.Context, w http.ResponseWriter,
 	var resp *http.Response
 	var node *upstreamNode
 	var proxy *proxyTransport
-	var toolAlias string
+	var toolRenames *wire.ToolRenames
 	var shaped bool
 	if route.Anonymous {
 		resp, err, _ = g.doAnonymousUpstream(ctx, route, bodies, ids, attempt-1)
 	} else {
-		body, alias, keyShaped := g.shapeKeyBody(bodies[route.Tier], route, route.Tier)
-		toolAlias, shaped = alias, keyShaped
-		setRequestShape(parent, shaped, toolAlias)
+		body, renames, keyShaped := g.shapeKeyBody(bodies[route.Tier], route, route.Tier)
+		toolRenames, shaped = renames, keyShaped
+		setRequestShape(parent, shaped, toolRenames)
 		pool, upstreamURL := g.zenNodes, g.cfg.Upstream.Zen
 		if route.Tier == config.TierGo {
 			pool, upstreamURL = g.goNodes, g.cfg.Upstream.Go
@@ -322,7 +322,7 @@ func (g *Gateway) rotationAttempt(parent context.Context, w http.ResponseWriter,
 			g.monitor.BeginStream()
 			defer g.monitor.EndStream()
 		}
-		streamBody := wire.RenameStreamReader(resp.Body, route.Protocol, v1ReadTool, toolAlias)
+		streamBody := wire.RenameStreamReader(resp.Body, route.Protocol, toolRenames)
 		usage, reported, committed, err := wire.RotationStream(original.Context(), w, streamBody, route.Protocol, external, alias, ready)
 		if meta != nil {
 			meta.Usage = usage
@@ -360,7 +360,7 @@ func (g *Gateway) rotationAttempt(parent context.Context, w http.ResponseWriter,
 		b, err = wire.CollapseStream(bytes.NewReader(b), route.Protocol, route.ID)
 	}
 	if err == nil {
-		b = wire.RenameResponseTool(b, route.Protocol, v1ReadTool, toolAlias)
+		b = wire.RenameResponseTool(b, route.Protocol, toolRenames)
 	}
 	var document map[string]any
 	if err == nil {
