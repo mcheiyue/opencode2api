@@ -405,13 +405,14 @@ func (g *Gateway) maxAnonymousExits() int {
 // proxy is tried at most once, up to performance.max_anonymous_exits proxies;
 // rotating #pool proxies may be drawn again until Retry.MaxAttempts proxies
 // were used. For each proxy it tries the upstreams in anonymousUpstreams
-// order: the configured v2 /inference upstream (Upstream.Anonymous) before the
-// v1 lane (models.V1Base). Any failure, including an HTTP error response,
-// advances to the next upstream or proxy; a proxy-route failure, or a proxy
-// marked unhealthy, skips that proxy's remaining upstreams. Only a successful
-// response ends the anonymous phase; exhausting the proxy cursor returns
-// control to the preferred authenticated tiers. It returns the last response
-// (body still open), else the last error, plus the number of attempts made.
+// order: the configured v2 /inference upstream (Upstream.Anonymous) only, since
+// the v1 lane fallback is retired and commented out there. Any failure,
+// including an HTTP error response, advances to the next upstream or proxy; a
+// proxy-route failure, or a proxy marked unhealthy, skips that proxy's
+// remaining upstreams. Only a successful response ends the anonymous phase;
+// exhausting the proxy cursor returns control to the preferred authenticated
+// tiers. It returns the last response (body still open), else the last error,
+// plus the number of attempts made.
 func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, error, int) {
 	if g.usesWARP(route.ID, config.TierZen, true) {
 		return g.doWarpAnonymousUpstream(ctx, route, bodies, ids, attemptOffset)
@@ -454,7 +455,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	preparedBodies := make([][]byte, len(upstreams))
 	toolRenames := make([]*wire.ToolRenames, len(upstreams))
 	for i, baseURL := range upstreams {
-		preparedBodies[i], toolRenames[i] = prepareAnonymousBody(rawBody, protocol, models.IsV1Upstream(baseURL))
+		preparedBodies[i], toolRenames[i] = prepareAnonymousBody(rawBody, protocol, models.IsV1Upstream(baseURL), v2RootSession(ids))
 	}
 	for proxies < limit {
 		if ctx.Err() != nil {
@@ -613,20 +614,21 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	return nil, lastErr, attempts
 }
 
-// anonymousUpstreams returns the ordered base URLs for the keyless free tier:
-// the configured v2 /inference origin (Upstream.Anonymous) is tried first, and
-// the v1 origin (models.V1Base) is kept as a fallback. Only the v1 origin is
-// returned when Upstream.Anonymous is empty or names that same origin.
+// anonymousUpstreams returns the ordered base URLs for the keyless free tier.
+// Only the v2 /inference origin is used: the 1.x /zen lane was retired for free
+// models, so the v1 fallback is commented out rather than called. The code is
+// kept for a revert; uncommenting the two lines marked below restores the old
+// order (v2 first, v1 as fallback).
 func (g *Gateway) anonymousUpstreams() []string {
-	v1 := strings.TrimRight(models.V1Base, "/")
+	// v1 := strings.TrimRight(models.V1Base, "/")
 	primary := strings.TrimRight(g.cfg.Upstream.Anonymous, "/")
-	if primary == "" || strings.EqualFold(v1, primary) {
-		return []string{models.V1Base}
+	if primary == "" {
+		// Config normalization fills this; keep the v2 default for a zero-value
+		// config so this never falls through to the retired v1 lane.
+		primary = "https://opencode.ai/inference"
 	}
-	// The configured base stays primary and the v1 origin is the fallback:
-	// demoting an explicitly configured base would silently change what it
-	// means. Trimmed here so a trailing slash cannot break the comparison.
-	return []string{primary, models.V1Base}
+	return []string{primary}
+	// return []string{g.cfg.Upstream.Anonymous, models.V1Base}
 }
 
 // inferenceClient picks the client of proxy for a request for model to
@@ -653,7 +655,7 @@ func (g *Gateway) inferenceClient(proxy *proxyTransport, baseURL, model string) 
 // an official CLI session on both the v1 (/zen) and v2 lanes. System One
 // payloads are decision requests, not agent traffic, so they are forwarded
 // verbatim, as is a body that is not a JSON object.
-func prepareAnonymousBody(body []byte, protocol wire.Protocol, v1 bool) ([]byte, *wire.ToolRenames) {
+func prepareAnonymousBody(body []byte, protocol wire.Protocol, v1 bool, session string) ([]byte, *wire.ToolRenames) {
 	if protocol == wire.SystemOne {
 		return body, nil
 	}
@@ -677,6 +679,9 @@ func prepareAnonymousBody(body []byte, protocol wire.Protocol, v1 bool) ([]byte,
 		changed = true
 	}
 	if !v1 && protocol == wire.Chat && ensureV2CompletionLimit(payload) {
+		changed = true
+	}
+	if !v1 && protocol == wire.Chat && ensureV2CacheKey(payload, session) {
 		changed = true
 	}
 	if !changed {
@@ -707,6 +712,19 @@ func ensureV2CompletionLimit(payload map[string]any) bool {
 		return false
 	}
 	payload["max_completion_tokens"] = v2CompletionLimit
+	return true
+}
+
+// ensureV2CacheKey states the v2 lane's conversation affinity in the body,
+// matching the session its headers name; a caller's own key is kept.
+func ensureV2CacheKey(payload map[string]any, session string) bool {
+	if session == "" {
+		return false
+	}
+	if _, ok := payload["prompt_cache_key"]; ok {
+		return false
+	}
+	payload["prompt_cache_key"] = session
 	return true
 }
 
@@ -849,7 +867,7 @@ func (g *Gateway) dumpOutboundBodies(route models.Route, bodies map[config.Tier]
 // shaped body, the tool renames to restore in the response, and whether the
 // body changed so the gateway can collapse the SSE stream a non-streaming
 // client receives back.
-func (g *Gateway) shapeKeyBody(body []byte, route models.Route, tier config.Tier) ([]byte, *wire.ToolRenames, bool) {
+func (g *Gateway) shapeKeyBody(body []byte, route models.Route, tier config.Tier, ids identity.RequestIDs) ([]byte, *wire.ToolRenames, bool) {
 	if !g.catalog.IsFreeModel(route.ID) {
 		return body, nil, false
 	}
@@ -857,7 +875,7 @@ func (g *Gateway) shapeKeyBody(body []byte, route models.Route, tier config.Tier
 	if tier == config.TierGo {
 		baseURL = g.cfg.Upstream.Go
 	}
-	shaped, renames := prepareAnonymousBody(body, route.ProtocolFor(tier), models.IsV1Upstream(baseURL))
+	shaped, renames := prepareAnonymousBody(body, route.ProtocolFor(tier), models.IsV1Upstream(baseURL), v2RootSession(ids))
 	return shaped, renames, !bytes.Equal(shaped, body)
 }
 
@@ -883,7 +901,7 @@ func (g *Gateway) doSelectedKeyUpstream(ctx context.Context, route models.Route,
 	if len(body) == 0 {
 		return nil, fmt.Errorf("no prepared %s request body", override.Tier), 0
 	}
-	shaped, toolRenames, changed := g.shapeKeyBody(body, route, override.Tier)
+	shaped, toolRenames, changed := g.shapeKeyBody(body, route, override.Tier, ids)
 	if changed {
 		body = shaped
 	}
@@ -964,7 +982,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 	if len(body) == 0 {
 		return nil, fmt.Errorf("no prepared %s request body", route.Tier), 0
 	}
-	shaped, toolRenames, changed := g.shapeKeyBody(body, route, route.Tier)
+	shaped, toolRenames, changed := g.shapeKeyBody(body, route, route.Tier, ids)
 	if changed {
 		body = shaped
 	}
@@ -1323,12 +1341,10 @@ func setV1Headers(header http.Header, protocol wire.Protocol, body []byte, ids i
 // anthropic-version and the beta query.
 func setV2Headers(header http.Header, protocol wire.Protocol, ids identity.RequestIDs) {
 	header.Set("x-opencode-client", "cli")
-	rootSession := ids.Session
+	rootSession := v2RootSession(ids)
 	if ids.ParentSession != "" {
-		parent := identity.CanonicalSessionID(ids.ParentSession)
-		rootSession = parent
-		header.Set("x-opencode-parent-session-id", parent)
-		header.Set("x-parent-session-id", parent)
+		header.Set("x-opencode-parent-session-id", rootSession)
+		header.Set("x-parent-session-id", rootSession)
 	}
 	childSession := ids.ChildSession
 	if childSession == "" {
@@ -1343,6 +1359,16 @@ func setV2Headers(header http.Header, protocol wire.Protocol, ids identity.Reque
 	if protocol == wire.Anthropic {
 		header.Set("anthropic-beta", "interleaved-thinking-2025-05-14")
 	}
+}
+
+// v2RootSession is the conversation affinity the v2 lane states three times in
+// its headers and once more as the body's prompt_cache_key, so a cached prefix
+// and the session that owns it can never disagree.
+func v2RootSession(ids identity.RequestIDs) string {
+	if ids.ParentSession != "" {
+		return identity.CanonicalSessionID(ids.ParentSession)
+	}
+	return ids.Session
 }
 
 // v1ProviderUtils names the provider-utils version of the AI SDK package the

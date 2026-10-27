@@ -222,7 +222,7 @@ func (g *Gateway) rotationAttempt(parent context.Context, w http.ResponseWriter,
 	if route.Anonymous {
 		resp, err, _ = g.doAnonymousUpstream(ctx, route, bodies, ids, attempt-1)
 	} else {
-		body, renames, keyShaped := g.shapeKeyBody(bodies[route.Tier], route, route.Tier)
+		body, renames, keyShaped := g.shapeKeyBody(bodies[route.Tier], route, route.Tier, ids)
 		toolRenames, shaped = renames, keyShaped
 		setRequestShape(parent, shaped, toolRenames)
 		pool, upstreamURL := g.zenNodes, g.cfg.Upstream.Zen
