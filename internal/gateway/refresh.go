@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"sync"
 	"time"
@@ -211,12 +210,16 @@ func (g *Gateway) StartModelRefresh(ctx context.Context) {
 	}()
 }
 
-// refreshProtocolCapabilities fetches OpenCode's capability catalog through
-// each healthy proxy in turn until one succeeds. Only a gateway without any
-// transport falls back to a direct client.
+// refreshProtocolCapabilities fetches OpenCode's capability catalog, dialing
+// directly first: public metadata gains nothing from egress diversity and
+// metered proxy pools pay for it. Proxies stay as the fallback.
 func (g *Gateway) refreshProtocolCapabilities(ctx context.Context) (modelcatalog.Capabilities, error) {
-	if g.transports == nil || len(g.transports.items) == 0 {
-		return modelcatalog.FetchCapabilities(ctx, &http.Client{Timeout: 30 * time.Second}, modelcatalog.CapabilitiesURL)
+	direct, directErr := modelcatalog.FetchCapabilities(ctx, &http.Client{Timeout: 30 * time.Second}, modelcatalog.CapabilitiesURL)
+	if directErr == nil {
+		return direct, nil
+	}
+	if g.transports == nil {
+		return modelcatalog.Capabilities{}, directErr
 	}
 	var lastErr error
 	for _, proxy := range g.transports.items {
@@ -230,7 +233,7 @@ func (g *Gateway) refreshProtocolCapabilities(ctx context.Context) (modelcatalog
 		lastErr = err
 	}
 	if lastErr == nil {
-		lastErr = errors.New("no healthy proxy available for OpenCode capability catalog")
+		lastErr = directErr
 	}
 	return modelcatalog.Capabilities{}, lastErr
 }
