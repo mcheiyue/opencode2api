@@ -223,6 +223,9 @@ func warpProxy(label string) *proxyTransport {
 // cursor do not, because a block is a property of the WARP exit and rotation
 // replaces it.
 func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, error, int) {
+	if wait, blocked := g.quotaGateWait(); blocked {
+		return quotaExhaustedResponse(wait), nil, 0
+	}
 	if !g.anonymous.AllowAttempt() {
 		return nil, errAnonymousLanePaused, 0
 	}
@@ -335,6 +338,7 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 		if blocked {
 			return lastResponse, errFreeTierIPBlocked, attempts
 		}
+		g.observeQuotaRejection(lastResponse)
 		return lastResponse, nil, attempts
 	}
 	if blocked {

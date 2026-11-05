@@ -19,7 +19,12 @@ type healthResponse struct {
 	Keys    healthKeys    `json:"keys"`
 	Proxies healthProxies `json:"proxies"`
 	Warp    *healthWarp   `json:"warp,omitempty"`
+	Quota   healthQuota   `json:"quota"`
 	Issues  []string      `json:"issues,omitempty"`
+}
+
+type healthQuota struct {
+	ExhaustedUntil string `json:"exhausted_until"`
 }
 
 type healthModels struct {
@@ -155,6 +160,7 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			Unhealthy: proxyTotal - proxyHealthy,
 		},
 		Warp:   warpStatus,
+		Quota:  healthQuota{ExhaustedUntil: g.quotaExhaustedUntil()},
 		Issues: issues,
 	})
 }
