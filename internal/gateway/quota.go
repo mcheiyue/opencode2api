@@ -57,6 +57,19 @@ func (q *quotaGate) remainingLocked() (time.Duration, bool) {
 	return wait, true
 }
 
+func (g *Gateway) capRetryAfter(resp *http.Response) {
+	limit := time.Duration(g.cfg.Retry.MaxRetryAfterSeconds) * time.Second
+	if limit <= 0 || resp == nil {
+		return
+	}
+	wait := parseRetryAfter(resp.Header.Get("Retry-After"))
+	if wait <= limit {
+		return
+	}
+	seconds := int((limit + time.Second - 1) / time.Second)
+	resp.Header.Set("Retry-After", strconv.Itoa(seconds))
+}
+
 func (g *Gateway) quotaGateWait() (time.Duration, bool) {
 	if g.quota == nil {
 		return 0, false

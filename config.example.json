@@ -20,7 +20,8 @@
   "retry": {
     "max_attempts": 3,
     "timeout_seconds": 300,
-    "quota_gate_seconds": 300
+    "quota_gate_seconds": 0,
+    "max_retry_after_seconds": 60
   },
   "models": {
     "refresh_seconds": 300,

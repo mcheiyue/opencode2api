@@ -335,6 +335,7 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 		return lastResponse, errDeterministicClientRejection, attempts
 	}
 	if lastResponse != nil {
+		g.capRetryAfter(lastResponse)
 		if blocked {
 			return lastResponse, errFreeTierIPBlocked, attempts
 		}

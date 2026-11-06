@@ -147,6 +147,9 @@ type RetryConfig struct {
 	// requests fail fast with that Retry-After instead of rotating exits.
 	// Zero disables the gate.
 	QuotaGateSeconds int `json:"quota_gate_seconds"`
+	// MaxRetryAfterSeconds caps the Retry-After handed to clients; the free
+	// tier reports the next daily reset. Zero leaves it untouched.
+	MaxRetryAfterSeconds int `json:"max_retry_after_seconds,omitempty"`
 }
 
 // ModelsConfig controls model discovery and routing. RefreshSeconds is the
@@ -346,7 +349,7 @@ func Load(path string) (Config, error) {
 		Listen:      "127.0.0.1:8080",
 		Warp:        WarpConfig{PoolSize: 2, Stack: string(warp.DefaultStack)},
 		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/zen", Go: "https://opencode.ai/zen/go", Anonymous: "https://opencode.ai/inference"},
-		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300, QuotaGateSeconds: 300},
+		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300, QuotaGateSeconds: 0, MaxRetryAfterSeconds: 60},
 		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
 		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15, StreamContinuation: false, StreamContinuationMax: 1, StreamContinuationTimeoutSeconds: 60, StreamContinuationAttemptTimeoutSeconds: 20, StreamContinuationSilentClose: false, StreamContinuationToolArgs: false},
 		Logging:     LoggingConfig{Level: "info", RingSize: 2000},
@@ -422,6 +425,9 @@ func Normalize(path string, cfg Config) (Config, error) {
 	}
 	if cfg.Retry.QuotaGateSeconds < 0 {
 		cfg.Retry.QuotaGateSeconds = 0
+	}
+	if cfg.Retry.MaxRetryAfterSeconds < 0 {
+		cfg.Retry.MaxRetryAfterSeconds = 0
 	}
 	if cfg.Models.RefreshSeconds < 1 {
 		return Config{}, errors.New("models.refresh_seconds must be at least 1")

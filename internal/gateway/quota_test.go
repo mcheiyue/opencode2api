@@ -91,6 +91,42 @@ func TestQuotaExhaustedResponse(t *testing.T) {
 	}
 }
 
+func TestCapRetryAfter(t *testing.T) {
+	newGateway := func(cap int) *Gateway {
+		return &Gateway{cfg: config.Config{Retry: config.RetryConfig{MaxRetryAfterSeconds: cap}}}
+	}
+	response := func(retryAfter string) *http.Response {
+		return &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{"Retry-After": []string{retryAfter}}}
+	}
+
+	capped := newGateway(60)
+	long := response("35970")
+	capped.capRetryAfter(long)
+	if got := long.Header.Get("Retry-After"); got != "60" {
+		t.Fatalf("long Retry-After = %q, want 60", got)
+	}
+
+	short := response("30")
+	capped.capRetryAfter(short)
+	if got := short.Header.Get("Retry-After"); got != "30" {
+		t.Fatalf("short Retry-After = %q, want 30", got)
+	}
+
+	disabled := newGateway(0)
+	untouched := response("35970")
+	disabled.capRetryAfter(untouched)
+	if got := untouched.Header.Get("Retry-After"); got != "35970" {
+		t.Fatalf("Retry-After = %q, want the upstream value", got)
+	}
+
+	noHeader := &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{}}
+	capped.capRetryAfter(noHeader)
+	if got := noHeader.Header.Get("Retry-After"); got != "" {
+		t.Fatalf("Retry-After = %q, want empty", got)
+	}
+	capped.capRetryAfter(nil)
+}
+
 func TestQuotaGateWaitGuardsNil(t *testing.T) {
 	g := &Gateway{}
 	if _, blocked := g.quotaGateWait(); blocked {
