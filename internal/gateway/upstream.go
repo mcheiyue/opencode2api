@@ -216,6 +216,9 @@ func (g *Gateway) doUpstream(ctx context.Context, route models.Route, bodies map
 	if _, selected := debugKeyOverrideFrom(ctx); selected {
 		return resp, effectiveRoute, err
 	}
+	if _, pinned := relayOverrideFrom(ctx); pinned {
+		return resp, effectiveRoute, err
+	}
 	if err != nil || resp == nil || resp.StatusCode != http.StatusBadRequest {
 		return resp, effectiveRoute, err
 	}
@@ -371,6 +374,9 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 	if route.Anonymous {
 		resp, err, used := g.doAnonymousUpstream(ctx, route, bodies, ids, attempts)
 		attempts += used
+		if _, pinned := relayOverrideFrom(ctx); pinned {
+			return resp, route, attempts, err
+		}
 		if err == nil && resp != nil && resp.StatusCode/100 == 2 {
 			return resp, route, attempts, nil
 		}
@@ -495,7 +501,7 @@ func (g *Gateway) maxAnonymousExits() int {
 // tiers. It returns the last response (body still open), else the last error,
 // plus the number of attempts made.
 func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, error, int) {
-	if g.usesWARP(route.ID, config.TierZen, true) {
+	if _, pinned := relayOverrideFrom(ctx); !pinned && g.usesWARP(route.ID, config.TierZen, true) {
 		return g.doWarpAnonymousUpstream(ctx, route, bodies, ids, attemptOffset)
 	}
 	// The breaker holds the lane shut for an hour-scale window after repeated

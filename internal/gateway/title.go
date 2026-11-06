@@ -154,12 +154,12 @@ func titleFallback(logger *slog.Logger, model string, rawBody []byte, lastRespon
 	var payload map[string]any
 	_ = json.Unmarshal(rawBody, &payload)
 	title := synthesizeTitle(payload)
-	stream, _ := payload["stream"].(bool)
 	if lastResponse != nil {
 		httpx.DrainAndClose(lastResponse.Body)
 	}
 	logger.Info("title generation request rejected by upstream; returning a synthesized title", "component", "upstream", "event", "title_fallback_synthesized", "model", model, "title", title)
-	return synthesizeTitleResponse(model, title, stream)
+	// 匿名上游统一返回 SSE，非流式调用由外层按同一协议收拢。
+	return synthesizeTitleResponse(model, title, true)
 }
 
 // synthesizeTitleResponse builds a 200 OpenAI Chat response carrying title,

@@ -134,9 +134,14 @@ async function save(event) {
       proxies: secretInputs("proxies"),
       proxyfile: $("#c-proxyfile").value,
       prefer: $("#c-prefer").value,
-      upstream: { zen: $("#c-up-zen").value, go: $("#c-up-go").value },
-      retry: { max_attempts: numberValue("#c-attempts"), timeout_seconds: numberValue("#c-timeout") },
+      upstream: { ...current.upstream, zen: $("#c-up-zen").value, go: $("#c-up-go").value },
+      retry: {
+        ...current.retry,
+        max_attempts: numberValue("#c-attempts"),
+        timeout_seconds: numberValue("#c-timeout"),
+      },
       models: {
+        ...current.models,
         refresh_seconds: numberValue("#c-refresh"),
         protocols: JSON.parse($("#c-protocols").value || "{}"),
         free_only: $("#c-free-only").checked,
@@ -147,6 +152,7 @@ async function save(event) {
         effort_by_model: JSON.parse($("#c-reasoning-by-model").value || "{}"),
       },
       performance: {
+        ...current.performance,
         max_idle_conns: numberValue("#c-idle"),
         max_idle_conns_per_host: numberValue("#c-idle-host"),
         max_conns_per_host: numberValue("#c-max-host"),

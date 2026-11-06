@@ -117,6 +117,43 @@ func TestForwardStreamResumable_splicesToolArgsIntoThePendingCall(t *testing.T) 
 	}
 }
 
+func TestForwardStreamResumableRenamedFragmentedToolArgs(t *testing.T) {
+	renamed := NewToolRenames()
+	wireName := ClientToolWireName("WriteDocument", map[string]bool{})
+	renamed.Add("WriteDocument", wireName)
+	frame := func(name, arguments string) string {
+		return chatFrame(map[string]any{"tool_calls": []any{map[string]any{
+			"index": 0, "id": "call_write", "type": "function",
+			"function": map[string]any{"name": name, "arguments": arguments},
+		}}})
+	}
+	body := frame(wireName[:6], `{"content":"first `) + frame(wireName[6:], "part")
+	resumer := &fakeResumer{toolArgs: true, toolSegment: func(request ToolArgsRequest) (io.Reader, error) {
+		if request.Name != "WriteDocument" || request.CallID != "call_write" || request.Partial != "first part" {
+			t.Fatalf("wrong continuation request: %+v", request)
+		}
+		return strings.NewReader(contentFrame(" and rest") + doneFrame), nil
+	}}
+	result := httptest.NewRecorder()
+	_, _, err := ForwardStreamResumable(context.Background(), result, RenameStreamReader(strings.NewReader(body), Chat, renamed), Chat, "test-model", resumer, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resumer.toolArgsCalls) != 1 {
+		t.Fatalf("tool argument continuations = %d, want 1", len(resumer.toolArgsCalls))
+	}
+	visible := result.Body.String()
+	if got := splicedArguments(t, visible); got != `{"content":"first part and rest"}` {
+		t.Fatalf("client arguments = %q", got)
+	}
+	if strings.Contains(visible, wireName) || strings.Count(visible, `"name":"WriteDocument"`) != 1 {
+		t.Fatalf("client tool name was lost or duplicated: %s", visible)
+	}
+	if !strings.Contains(visible, `"finish_reason":"tool_calls"`) || !strings.Contains(visible, "data: [DONE]") {
+		t.Fatalf("tool call lacks a terminal: %s", visible)
+	}
+}
+
 // splicedArguments concatenates the argument fragments the client would append
 // from the emitted frames, which is what the client's parser ends up with.
 func splicedArguments(t *testing.T, visible string) string {
