@@ -487,6 +487,7 @@ type KeyStatus struct {
 	Tier          string     `json:"tier"`
 	Index         int        `json:"index"`
 	ProxyIndex    int        `json:"proxy_index"`
+	Bound         bool       `json:"bound,omitempty"`
 	Failures      uint32     `json:"failures"`
 	CooldownUntil *time.Time `json:"cooldown_until,omitempty"`
 }
@@ -585,6 +586,15 @@ type DebugKeyView struct {
 	CooldownUntil *time.Time  `json:"cooldown_until,omitempty"`
 }
 
+// DebugRelays lists the anonymous relays in pool order for the Playground.
+func (m *RuntimeController) DebugRelays() []string {
+	rt := m.current.Load()
+	if rt == nil || rt.gateway == nil {
+		return nil
+	}
+	return rt.gateway.RelayNames()
+}
+
 // DebugKeys lists every configured upstream key per tier so the Playground can
 // offer an explicit per-key test target.
 func (m *RuntimeController) DebugKeys() map[string][]DebugKeyView {
@@ -647,7 +657,7 @@ func (m *RuntimeController) DebugRouteForTier(model string, tier config.Tier) (m
 func keyStatuses(tier string, pool *upstreamNodes) []KeyStatus {
 	result := make([]KeyStatus, 0, len(pool.nodes))
 	for _, node := range pool.nodes {
-		status := KeyStatus{ID: config.KeyDisplayID(node.key), Tier: tier, Index: node.index, ProxyIndex: int(node.proxyIndex.Load()), Failures: node.failures.Load()}
+		status := KeyStatus{ID: config.KeyDisplayID(node.key), Tier: tier, Index: node.index, ProxyIndex: int(node.proxyIndex.Load()), Bound: node.bound, Failures: node.failures.Load()}
 		if until := node.cooldownUntil.Load(); until > time.Now().UnixNano() {
 			value := time.Unix(0, until).UTC()
 			status.CooldownUntil = &value

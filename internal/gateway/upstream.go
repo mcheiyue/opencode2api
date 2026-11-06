@@ -59,6 +59,87 @@ func WithDebugKeyOverride(ctx context.Context, override DebugKeyOverride) contex
 	return context.WithValue(WithDiagnosticRequest(ctx), debugKeyOverrideContextKey{}, override)
 }
 
+// RelaySelection names one configured upstream relay (proxy) so a diagnostic
+// request can be pinned to it. Index is the position in the configured proxy
+// list, Name is the proxy URL; supplying both requires them to agree. Either
+// alone is enough, and an empty selection means normal routing.
+type RelaySelection struct {
+	Index *int   `json:"index,omitempty"`
+	Name  string `json:"name,omitempty"`
+}
+
+// Empty reports whether the selection names no relay.
+func (r RelaySelection) Empty() bool {
+	return r.Index == nil && r.Name == ""
+}
+
+type relayOverrideContextKey struct{}
+
+// WithRelayOverride pins one inference request to a single configured relay,
+// on every tier: the anonymous lane walks exactly that exit and a key request
+// is sent through that proxy, each with a single attempt and no failover.
+// Session minting, system prompt, tool shaping and the transport stay the
+// production path. The request is marked diagnostic, so the pinned attempt
+// changes no cooldown, proxy health or IP-block state and cannot poison the
+// relays it is meant to measure.
+func WithRelayOverride(ctx context.Context, selection RelaySelection) context.Context {
+	return context.WithValue(WithDiagnosticRequest(ctx), relayOverrideContextKey{}, selection)
+}
+
+func relayOverrideFrom(ctx context.Context) (RelaySelection, bool) {
+	selection, ok := ctx.Value(relayOverrideContextKey{}).(RelaySelection)
+	if !ok || selection.Empty() {
+		return RelaySelection{}, false
+	}
+	return selection, true
+}
+
+// RelayNames lists the configured relays in configuration order, with any
+// credentials redacted, so a caller can name one by index or by URL.
+func (g *Gateway) RelayNames() []string {
+	if g.transports == nil {
+		return nil
+	}
+	names := make([]string, 0, len(g.transports.items))
+	for _, transport := range g.transports.items {
+		if transport != nil {
+			names = append(names, config.RedactURL(transport.name))
+		}
+	}
+	return names
+}
+
+// RelayProxy resolves a selection against the configured proxies. It reports
+// false when nothing matches, so a typo surfaces as an error instead of a
+// silent fallback to normal routing.
+func (g *Gateway) RelayProxy(selection RelaySelection) (*proxyTransport, bool) {
+	if g.transports == nil {
+		return nil, false
+	}
+	index := -1
+	if selection.Index != nil {
+		index = *selection.Index
+		if index < 0 || index >= len(g.transports.items) {
+			return nil, false
+		}
+	}
+	for i, transport := range g.transports.items {
+		if transport == nil {
+			continue
+		}
+		if index >= 0 && i != index {
+			continue
+		}
+		if selection.Name != "" && transport.name != selection.Name && config.RedactURL(transport.name) != selection.Name {
+			continue
+		}
+		return transport, true
+	}
+	return nil, false
+}
+
+var errRelayNotFound = errors.New("relay does not match any configured proxy")
+
 func debugKeyOverrideFrom(ctx context.Context) (DebugKeyOverride, bool) {
 	override, ok := ctx.Value(debugKeyOverrideContextKey{}).(DebugKeyOverride)
 	return override, ok && override.KeyID != ""
@@ -433,16 +514,32 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	// then reports errDeterministicClientRejection so the caller keeps this
 	// 4xx instead of replacing it with a later tier's answer.
 	halted := false
-	cursor := g.anonymous.CursorFor(ids.Session)
+	cursor := g.anonymous.CursorForOffset(ids.Session, attemptOffset)
 	limit := min(g.anonymous.Len(), g.maxAnonymousExits())
 	if g.anonymous.HasPool() && g.cfg.Retry.MaxAttempts > limit {
 		limit = g.cfg.Retry.MaxAttempts
+	}
+	// A relay-pinned diagnostic sends exactly one attempt through the chosen
+	// exit, so the answer describes that relay alone. An unresolvable relay is
+	// an error rather than a silent fallback, because a typo would otherwise
+	// read as a relay verdict.
+	if selection, ok := relayOverrideFrom(ctx); ok {
+		proxy, found := g.RelayProxy(selection)
+		if !found {
+			return nil, errRelayNotFound, 0
+		}
+		cursor = g.anonymous.CursorForProxy(proxy)
+		limit = 1
 	}
 	proxies := 0
 	attempts := 0
 	rawBody := bodies[config.TierZen]
 	if len(rawBody) == 0 {
 		return nil, errors.New("no prepared Zen request body"), 0
+	}
+	isTitle := isTitleGenerationBody(rawBody)
+	if isTitle {
+		limit = 1
 	}
 	// The anonymous free tier only serves agent-shaped streaming requests
 	// carrying the required tool definitions (anything else is rejected with 403
@@ -588,6 +685,11 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			g.logger.Warn("anonymous lane circuit breaker opened", "component", "upstream", "event", "anonymous_breaker_open", "reason", "all_exits_blocked", "request_id", ids.Request, "paused_for", pause.String())
 		}
 	}
+	if isTitle {
+		if fallback := titleFallback(g.logger, route.ID, rawBody, lastResponse, lastErr); fallback != nil {
+			return fallback, nil, attempts
+		}
+	}
 	if lastResponse != nil {
 		// The caller keeps and forwards this response; a block or a
 		// deterministic rejection only changes the error so the keyed tiers
@@ -676,9 +778,13 @@ func prepareAnonymousBody(body []byte, protocol wire.Protocol, v1 bool, session 
 	if injectOfficialPrompt(payload, protocol, v1) {
 		changed = true
 	}
-	renames, toolsChanged := renameAndCompleteTools(payload, protocol, v1)
-	if toolsChanged {
-		changed = true
+	var renames *wire.ToolRenames
+	if !isTitleGenerationRequest(payload) {
+		var toolsChanged bool
+		renames, toolsChanged = renameAndCompleteTools(payload, protocol, v1)
+		if toolsChanged {
+			changed = true
+		}
 	}
 	if !v1 && protocol == wire.Chat && ensureV2CompletionLimit(payload) {
 		changed = true
@@ -908,8 +1014,11 @@ func (g *Gateway) doSelectedKeyUpstream(ctx context.Context, route models.Route,
 		body = shaped
 	}
 	setRequestShape(ctx, changed, toolRenames)
-	useWARP := g.usesWARP(route.ID, override.Tier, false)
+	useWARP := !node.bound && g.usesWARP(route.ID, override.Tier, false)
 	proxy := nodes.Proxy(node)
+	if pinned, ok := g.relayPin(ctx, proxy); ok {
+		proxy, useWARP = pinned, false
+	}
 	if !useWARP {
 		if proxy == nil {
 			return nil, errors.New("selected upstream key has no proxy binding"), 0
@@ -990,7 +1099,13 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 	}
 	setRequestShape(ctx, changed, toolRenames)
 	useWARP := g.usesWARP(route.ID, route.Tier, false)
-	for attempts < g.cfg.Retry.MaxAttempts {
+	// A relay-pinned diagnostic gets exactly one attempt: rotating keys would
+	// no longer describe the relay that was asked for.
+	attemptLimit := g.cfg.Retry.MaxAttempts
+	if _, pinned := relayOverrideFrom(ctx); pinned {
+		attemptLimit = 1
+	}
+	for attempts < attemptLimit {
 		if ctx.Err() != nil {
 			// Same guard as the anonymous loop: an exhausted request budget
 			// must not be spent rotating keys that were never really tried.
@@ -1003,6 +1118,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 		if node == nil {
 			break
 		}
+		attemptUseWARP := !node.bound && useWARP
 		attempts++
 		// Keep the request-level trace synchronized with the attempt that is
 		// about to be sent. Only the redacted key suffix is retained.
@@ -1019,7 +1135,12 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 			return nil, err, attempts
 		}
 		proxy := nodes.Proxy(node)
-		if !useWARP {
+		// A relay pin replaces the proxy the key is bound to, so a pinned
+		// diagnostic measures that relay alone.
+		if pinned, ok := g.relayPin(ctx, proxy); ok {
+			proxy, attemptUseWARP = pinned, false
+		}
+		if !attemptUseWARP {
 			if proxy == nil {
 				lastErr = errors.New("upstream key has no proxy binding")
 				break
@@ -1029,7 +1150,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 			}
 		}
 		keyID := config.KeyDisplayID(node.key)
-		if useWARP {
+		if attemptUseWARP {
 			setRequestCredential(ctx, route.Tier, keyID, "key", false, nil)
 		} else {
 			setRequestCredential(ctx, route.Tier, keyID, "key", false, proxy)
@@ -1037,7 +1158,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 		attemptStarted := time.Now()
 		var resp *http.Response
 		var egress string
-		if useWARP {
+		if attemptUseWARP {
 			resp, egress, err = g.doWARPAttempt(ctx, req, baseURL, route.ID, time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds)*time.Second)
 		} else {
 			resp, err = doInferenceAttempt(g.inferenceClient(proxy, baseURL, route.ID), req, time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds)*time.Second, g.attemptTimeout)
@@ -1056,7 +1177,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 		}
 		recordProxy := proxy
 		proxyLabel := ""
-		if useWARP {
+		if attemptUseWARP {
 			recordProxy = warpProxy(egress)
 			proxyLabel = egress
 			g.observeKeyResultWARP(ctx, nodes, node, resp, err)
@@ -1213,6 +1334,9 @@ func (g *Gateway) recordUpstreamAttempt(ctx context.Context, route models.Route,
 			leg += strconv.Itoa(status)
 		}
 		leg += ":" + strconv.FormatInt(max(duration.Milliseconds(), 0), 10) + "ms"
+		if anonymous && proxy != nil {
+			leg += "@" + config.RedactURL(proxy.name)
+		}
 		meta.Legs = append(meta.Legs, leg)
 	}
 	if g.monitor == nil {
@@ -1227,6 +1351,13 @@ func (g *Gateway) recordUpstreamAttempt(ctx context.Context, route models.Route,
 		KeyID: keyID, Channel: channel, Anonymous: anonymous, Proxy: proxyName, Status: status,
 		DurationMS: max(duration.Milliseconds(), 0), Success: success, Outcome: outcome,
 	})
+	if !isDiagnosticRequest(ctx) && g.availability != nil && g.catalog.IsFreeModel(route.ID) {
+		bodySnippet := ""
+		if resp != nil && (resp.StatusCode == 400 || resp.StatusCode == 404 || resp.StatusCode == 410 || resp.StatusCode == 422) {
+			bodySnippet = string(peekResponseBody(resp))
+		}
+		_ = g.availability.RecordPassiveObservation(route.ID, success, status, bodySnippet, channel, time.Now().UTC())
+	}
 }
 
 // upstreamRequest builds the POST for one attempt: baseURL plus the protocol's
@@ -1552,4 +1683,18 @@ func projectID(project string) string {
 // which can be specific to the key. A transport error is never non-retryable.
 func isNonRetryableClientResponse(resp *http.Response, err error) bool {
 	return err == nil && resp != nil && resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests
+}
+
+// relayPin returns the proxy a relay-pinned diagnostic names, and whether a
+// pin applied. An unresolvable pin keeps the request on its normal proxy: the
+// admin endpoint validates the selection before it reaches here.
+func (g *Gateway) relayPin(ctx context.Context, current *proxyTransport) (*proxyTransport, bool) {
+	selection, ok := relayOverrideFrom(ctx)
+	if !ok {
+		return current, false
+	}
+	if pinned, found := g.RelayProxy(selection); found {
+		return pinned, true
+	}
+	return current, false
 }

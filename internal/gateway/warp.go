@@ -193,7 +193,11 @@ func (g *Gateway) doWARPAttempt(ctx context.Context, req *http.Request, baseURL,
 		if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
 			body = peekResponseBody(resp)
 		}
-		g.warp.Report(lease, resp.StatusCode, body)
+		var retryAfter time.Duration
+		if resp.StatusCode == http.StatusTooManyRequests {
+			retryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
+		}
+		g.warp.ReportWithRetryAfter(lease, resp.StatusCode, body, retryAfter)
 	}
 	resp.Body = &warpBody{ReadCloser: resp.Body, lease: owned, diagnostic: diagnostic}
 	return resp, label, nil
@@ -244,8 +248,10 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 	// A 429 is scoped to the exit that carried it, so the request keeps
 	// rotating exits until the configured attempt budget is spent; only then
 	// does the last 429 reach the client.
+	isTitle := isTitleGenerationBody(rawBody)
 	limit := g.cfg.Retry.MaxAttempts
-	if limit < 1 {
+	if limit < 1 || isTitle {
+		// A title request gets one attempt: on failure it is answered locally.
 		limit = 1
 	}
 	firstEventTimeout := time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds) * time.Second
@@ -253,6 +259,7 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 	var lastErr error
 	blocked, halted := false, false
 	attempts := 0
+	triedEgresses := make(map[string]bool)
 	for attempts < limit {
 		if ctx.Err() != nil {
 			if lastErr == nil {
@@ -316,6 +323,13 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 				g.logger.Warn("upstream rejected the request; not trying other upstreams", "component", "upstream", "event", "deterministic_rejection", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "status", status, "duration_ms", duration.Milliseconds())
 				break
 			}
+			if status == http.StatusTooManyRequests {
+				triedEgresses[strings.TrimPrefix(egress, "warp:")] = true
+				if !g.warp.HasUntriedActive(triedEgresses) {
+					g.logger.Warn("all active WARP exits exhausted or cooling down; stopping retries", "component", "upstream", "event", "warp_429_exhausted", "request_id", ids.Request, "attempt", attempts)
+					break
+				}
+			}
 			g.logger.Debug("anonymous WARP upstream returned an error response; trying the next upstream or exit", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", egress, "status", status, "duration_ms", duration.Milliseconds())
 			if index+1 < len(upstreams) {
 				break
@@ -323,6 +337,11 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 		}
 		if halted || ctx.Err() != nil {
 			break
+		}
+		if status := upstreamStatus(lastResponse); status == http.StatusTooManyRequests {
+			if !g.warp.HasUntriedActive(triedEgresses) {
+				break
+			}
 		}
 		if !leaseBlocked && upstreamStatus(lastResponse) != http.StatusTooManyRequests {
 			if pause, tripped := g.anonymous.NoteFailure(); tripped {
@@ -333,6 +352,11 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 	}
 	if halted {
 		return lastResponse, errDeterministicClientRejection, attempts
+	}
+	if isTitle {
+		if fallback := titleFallback(g.logger, route.ID, rawBody, lastResponse, lastErr); fallback != nil {
+			return fallback, nil, attempts
+		}
 	}
 	if lastResponse != nil {
 		g.capRetryAfter(lastResponse)

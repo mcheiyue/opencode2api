@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"opencode2api/internal/config"
@@ -94,6 +95,8 @@ type Gateway struct {
 	// anonymous cursor. Zero uses freeTierBlockTTL.
 	freeTierBlock time.Duration
 	quota         *quotaGate
+	// refreshMu prevents overlapping catalog refreshes across concurrent or scheduled callers.
+	refreshMu sync.Mutex
 }
 
 // New builds a Gateway for cfg: one proxy transport per runtime proxy (a
@@ -102,6 +105,9 @@ type Gateway struct {
 // rotation manager is not persisted; RuntimeController replaces it with the
 // shared one.
 func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics, warpPool *warp.Pool) (*Gateway, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	cfg.Rotation.Defaults()
 	rotationManager, err := rotation.New("", cfg.Rotation)
 	if err != nil {
@@ -112,11 +118,11 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics, war
 		return nil, err
 	}
 	cooldown := time.Duration(cfg.Performance.FailureCooldownSeconds) * time.Second
-	zenNodes, err := nodePool(cfg.ZenKeys, transports, cooldown)
+	zenNodes, err := nodePool(cfg.ZenKeys, transports, cooldown, cfg.ProxyBindings)
 	if err != nil {
 		return nil, fmt.Errorf("zen node pool: %w", err)
 	}
-	goNodes, err := nodePool(cfg.GoKeys, transports, cooldown)
+	goNodes, err := nodePool(cfg.GoKeys, transports, cooldown, cfg.ProxyBindings)
 	if err != nil {
 		return nil, fmt.Errorf("go node pool: %w", err)
 	}
