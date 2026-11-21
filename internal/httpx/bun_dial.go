@@ -23,6 +23,14 @@ import (
 // http.DefaultTransport.
 const bunHandshakeTimeout = 10 * time.Second
 
+type ProxyConnectError struct {
+	StatusCode int
+}
+
+func (err *ProxyConnectError) Error() string {
+	return fmt.Sprintf("proxy refused CONNECT: HTTP %d", err.StatusCode)
+}
+
 // bunClientHello returns the ClientHello of Bun's fetch, captured from Bun
 // 1.4.3. Bun links its own BoringSSL, so the hello is the same on every
 // platform: JA4 t13d1713h1, no GREASE, no padding, http/1.1 as the only ALPN
@@ -126,7 +134,8 @@ func (t *BunTransport) dialProxy(ctx context.Context, addr string) (net.Conn, er
 	if err != nil {
 		return nil, &net.OpError{Op: op, Net: "tcp", Err: err}
 	}
-	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	rawConn := conn
+	stop := context.AfterFunc(ctx, func() { rawConn.Close() })
 	_ = conn.SetDeadline(time.Now().Add(bunHandshakeTimeout))
 	if t.proxy.Scheme == "https" {
 		tlsConn := tls.Client(conn, &tls.Config{ServerName: t.proxy.Hostname()})
@@ -189,7 +198,7 @@ func httpConnect(conn net.Conn, user *url.Userinfo, addr string) (net.Conn, erro
 		return conn, err
 	}
 	if resp.StatusCode/100 != 2 {
-		return conn, fmt.Errorf("proxy refused CONNECT: %s", resp.Status)
+		return conn, &ProxyConnectError{StatusCode: resp.StatusCode}
 	}
 	if reader.Buffered() > 0 {
 		return &bufferedConn{Conn: conn, reader: reader}, nil
@@ -260,7 +269,7 @@ func socks5Connect(conn net.Conn, user *url.Userinfo, addr string) error {
 		if _, err := io.ReadFull(conn, reply); err != nil {
 			return err
 		}
-		if reply[1] != 0 {
+		if reply[0] != 1 || reply[1] != 0 {
 			return errors.New("username/password authentication failed")
 		}
 	default:
@@ -284,7 +293,7 @@ func socks5Connect(conn net.Conn, user *url.Userinfo, addr string) error {
 	if _, err := io.ReadFull(conn, header); err != nil {
 		return err
 	}
-	if header[0] != 5 {
+	if header[0] != 5 || header[2] != 0 {
 		return fmt.Errorf("unexpected protocol version %d", header[0])
 	}
 	if header[1] != 0 {

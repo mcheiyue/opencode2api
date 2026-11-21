@@ -71,34 +71,106 @@ export function renderFacts(host, entries) {
   }
 }
 
+const openDialogs = new Set();
+const inertBackground = new Map();
+
+function setDialogBackgroundInert() {
+  if (inertBackground.size) return;
+  const dialogHost = $("#dialog-host");
+  for (const node of document.body.children) {
+    if (node === dialogHost) continue;
+    inertBackground.set(node, node.hasAttribute("inert"));
+    node.setAttribute("inert", "");
+  }
+}
+
+function restoreDialogBackground() {
+  if (openDialogs.size) return;
+  for (const [node, wasInert] of inertBackground) {
+    if (wasInert) node.setAttribute("inert", "");
+    else node.removeAttribute("inert");
+  }
+  inertBackground.clear();
+}
+
 // Generic dialog host; onClose fires on every close path so promise-based
 // dialogs settle exactly once.
 export function openDialog({ title, body = null, size = "", actions = [], onClose }) {
   const previous = document.activeElement;
+  const dialogHost = $("#dialog-host");
+  const previousDialogs = $$(".dialog", dialogHost).map((node) => [node, node.hasAttribute("inert")]);
+  for (const [node] of previousDialogs) node.setAttribute("inert", "");
+  setDialogBackgroundInert();
   const titleId = `dialog-title-${Math.random().toString(36).slice(2, 8)}`;
+  const bodyId = `dialog-body-${Math.random().toString(36).slice(2, 8)}`;
   const overlay = el("div", { class: "dialog-overlay" });
   const dialog = el("div", {
     class: `dialog ${size}`.trim(),
     role: "dialog",
     "aria-modal": "true",
     "aria-labelledby": titleId,
+    tabindex: "-1",
   });
   dialog.append(el("h2", { id: titleId, class: "dialog-title", text: title }));
-  if (body) dialog.append(body);
+  if (body) {
+    if (body instanceof Element) {
+      body.id ||= bodyId;
+      dialog.setAttribute("aria-describedby", body.id);
+    }
+    dialog.append(body);
+  }
+  const focusable = () => [...dialog.querySelectorAll(
+    'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+  )].filter((node) => node.getClientRects().length > 0);
+  const isTopmost = () => [...document.querySelectorAll(".dialog")].at(-1) === dialog;
   let closed = false;
   const close = () => {
     if (closed) return;
     closed = true;
+    openDialogs.delete(close);
     overlay.remove();
+    for (const [node, wasInert] of previousDialogs) {
+      if (wasInert) node.setAttribute("inert", "");
+      else node.removeAttribute("inert");
+    }
     document.removeEventListener("keydown", onKey, true);
+    document.removeEventListener("focusin", onFocusIn, true);
+    restoreDialogBackground();
     if (previous instanceof HTMLElement && previous.isConnected) previous.focus();
     onClose?.();
   };
+  openDialogs.add(close);
   const onKey = (event) => {
+    if (!isTopmost()) return;
     if (event.key === "Escape") {
       event.stopPropagation();
       close();
+      return;
     }
+    if (event.key !== "Tab") return;
+    const nodes = focusable();
+    if (!nodes.length) {
+      event.preventDefault();
+      dialog.focus();
+      return;
+    }
+    const first = nodes[0];
+    const last = nodes[nodes.length - 1];
+    if (!dialog.contains(document.activeElement)) {
+      event.preventDefault();
+      (event.shiftKey ? last : first).focus();
+    } else if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+  const onFocusIn = (event) => {
+    if (!isTopmost() || dialog.contains(event.target)) return;
+    const [first] = focusable();
+    (first || dialog).focus();
   };
   if (actions.length) {
     const row = el("div", { class: "dialog-actions" });
@@ -119,10 +191,15 @@ export function openDialog({ title, body = null, size = "", actions = [], onClos
     if (event.target === overlay) close();
   });
   document.addEventListener("keydown", onKey, true);
-  $("#dialog-host").append(overlay);
+  document.addEventListener("focusin", onFocusIn, true);
+  dialogHost.append(overlay);
   const target = dialog.querySelector("input, select, textarea") || dialog.querySelector(".dialog-actions .btn");
-  target?.focus();
+  (target || dialog).focus();
   return { close, dialog };
+}
+
+export function closeDialogs() {
+  for (const close of [...openDialogs]) close();
 }
 
 export function confirmDialog({
@@ -196,15 +273,49 @@ export function promptDialog({
 export function bindTabs(page, onSwitch) {
   const buttons = $$(".tabs .tab", page);
   const panels = $$("[data-panel]", page);
+  const tabScope = page.id || "tabs";
+  const slug = (value) => String(value).replace(/[^a-z0-9_-]+/gi, "-");
+  for (const button of buttons) {
+    const id = button.dataset.tab;
+    const panel = panels.find((candidate) => candidate.dataset.panel === id);
+    if (!panel) continue;
+    const tabId = button.id || `${tabScope}-tab-${slug(id)}`;
+    const panelId = panel.id || `${tabScope}-panel-${slug(id)}`;
+    button.id = tabId;
+    panel.id = panelId;
+    button.type = "button";
+    button.tabIndex = button.classList.contains("active") ? 0 : -1;
+    button.setAttribute("aria-controls", panelId);
+    panel.setAttribute("aria-labelledby", tabId);
+    panel.setAttribute("aria-hidden", button.classList.contains("active") ? "false" : "true");
+  }
   const activate = (id) => {
     for (const button of buttons) {
       const active = button.dataset.tab === id;
       button.classList.toggle("active", active);
       button.setAttribute("aria-selected", active ? "true" : "false");
+      button.tabIndex = active ? 0 : -1;
+      const panel = panels.find((candidate) => candidate.dataset.panel === button.dataset.tab);
+      if (panel) panel.setAttribute("aria-hidden", active ? "false" : "true");
     }
     for (const panel of panels) panel.classList.toggle("hidden", panel.dataset.panel !== id);
     onSwitch?.(id);
   };
-  for (const button of buttons) button.addEventListener("click", () => activate(button.dataset.tab));
+  for (const button of buttons) {
+    button.addEventListener("click", () => activate(button.dataset.tab));
+    button.addEventListener("keydown", (event) => {
+      const index = buttons.indexOf(button);
+      let nextIndex = index;
+      if (event.key === "ArrowRight" || event.key === "ArrowDown") nextIndex = (index + 1) % buttons.length;
+      else if (event.key === "ArrowLeft" || event.key === "ArrowUp") nextIndex = (index - 1 + buttons.length) % buttons.length;
+      else if (event.key === "Home") nextIndex = 0;
+      else if (event.key === "End") nextIndex = buttons.length - 1;
+      else return;
+      event.preventDefault();
+      const next = buttons[nextIndex];
+      activate(next.dataset.tab);
+      next.focus();
+    });
+  }
   return { activate };
 }

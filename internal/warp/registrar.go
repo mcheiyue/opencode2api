@@ -93,7 +93,8 @@ func newRegistrar() *registrar {
 	return &registrar{
 		base: defaultAPIBase,
 		client: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout:       30 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 			Transport: &http.Transport{
 				Proxy:               nil,
 				ForceAttemptHTTP2:   false,
@@ -255,8 +256,15 @@ func uniqueEndpoints(endpoints []string) []string {
 }
 
 func (r *registrar) doJSON(ctx context.Context, method, path string, body []byte, token string, target any) error {
+	// Only a request that cannot create a second device may be replayed. A
+	// retried POST /reg would register duplicate devices and burn pool slots;
+	// the pool already retries a failed registration on its own schedule.
+	attempts := 1
+	if replayableRequest(method, body) {
+		attempts = 4
+	}
 	var lastErr error
-	for attempt := 0; attempt < 4; attempt++ {
+	for attempt := 0; attempt < attempts; attempt++ {
 		if attempt > 0 {
 			wait := time.Duration(1<<(attempt-1)) * 2 * time.Second
 			timer := time.NewTimer(wait)
@@ -293,7 +301,6 @@ func (r *registrar) doJSON(ctx context.Context, method, path string, body []byte
 			continue
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			bodyText := strings.TrimSpace(string(data))
 			if resp.StatusCode == http.StatusTooManyRequests {
 				// Cloudflare's own limit becomes the pacing. Record it and fail
 				// fast: sleeping here would hold the pool's create mutex and
@@ -306,9 +313,11 @@ func (r *registrar) doJSON(ctx context.Context, method, path string, body []byte
 					pause = maxRateLimitPause
 				}
 				r.pause(pause)
-				return &registrationPausedError{retryAfter: pause, reason: bodyText}
+				return &registrationPausedError{retryAfter: pause, reason: "Cloudflare rate limit"}
 			}
-			lastErr = fmt.Errorf("Cloudflare API HTTP %d: %s", resp.StatusCode, bodyText)
+			// Registration replies can echo device credentials. Retain the
+			// status for diagnostics without putting those replies into logs.
+			lastErr = fmt.Errorf("Cloudflare API HTTP %d", resp.StatusCode)
 			if resp.StatusCode < 500 {
 				return lastErr
 			}
@@ -323,6 +332,17 @@ func (r *registrar) doJSON(ctx context.Context, method, path string, body []byte
 		lastErr = errors.New("Cloudflare API request failed")
 	}
 	return lastErr
+}
+
+func replayableRequest(method string, body []byte) bool {
+	if body != nil {
+		return false
+	}
+	switch method {
+	case http.MethodGet, http.MethodHead:
+		return true
+	}
+	return false
 }
 
 func wireGuardKeypair() (string, string, error) {

@@ -16,7 +16,7 @@ func TestPrepareAnonymousBodyHidesClientToolNames(t *testing.T) {
 		{"type":"function","function":{"name":"ScheduleWakeup","parameters":{"type":"object","properties":{}}}}
 	]}`)
 
-	shaped, renames := prepareAnonymousBody(body, wire.Chat, false, session)
+	shaped, renames := prepareAnonymousBody(body, wire.Chat, false, session, nil)
 	if len(shaped) == 0 {
 		t.Fatal("no shaped body")
 	}
@@ -60,7 +60,7 @@ func TestPrepareAnonymousBodyHidesClientToolNames(t *testing.T) {
 
 func TestPrepareAnonymousBodyRestoresToolCalls(t *testing.T) {
 	body := []byte(`{"model":"deepseek-v4.1-flash-free","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"ScheduleWakeup","parameters":{"type":"object","properties":{}}}}]}`)
-	_, renames := prepareAnonymousBody(body, wire.Chat, false, "ses_0123456789abFFEdcba9876543210")
+	_, renames := prepareAnonymousBody(body, wire.Chat, false, "ses_0123456789abFFEdcba9876543210", nil)
 	wireName, ok := renames.Wire("ScheduleWakeup")
 	if !ok {
 		t.Fatal("no wire name recorded")

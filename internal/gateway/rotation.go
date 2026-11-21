@@ -15,6 +15,7 @@ import (
 	"opencode2api/internal/identity"
 	"opencode2api/internal/jsonutil"
 	"opencode2api/internal/models"
+	"opencode2api/internal/oauth"
 	wire "opencode2api/internal/protocol"
 	"opencode2api/internal/rotation"
 	"opencode2api/internal/telemetry"
@@ -26,7 +27,7 @@ import (
 func (g *Gateway) syncRotation() {
 	available := map[string]bool{}
 	for _, model := range g.catalog.List() {
-		if route, err := g.catalog.Route(model, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0, g.cfg.Anonymous); err == nil && route.Protocol != wire.SystemOne {
+		if route, err := g.routeForModel(model, ""); err == nil && route.Protocol != wire.SystemOne {
 			available[model] = true
 		}
 	}
@@ -101,6 +102,10 @@ func (g *Gateway) handleRotation(w http.ResponseWriter, r *http.Request, externa
 		meta.Session = ids.Session
 		meta.ModelAlias = alias
 	}
+	if g.cfg.GoOAuth != nil && g.cfg.GoOAuth.NeedsLogin {
+		wire.WriteError(w, external, http.StatusServiceUnavailable, (&oauth.OAuthError{Code: "invalid_grant"}).Error(), "oauth_auth_error", ids.Request)
+		return
+	}
 	visited := map[string]bool{}
 	ordinaryModels, total := 0, 0
 	for ctx.Err() == nil {
@@ -109,8 +114,13 @@ func (g *Gateway) handleRotation(w http.ResponseWriter, r *http.Request, externa
 			break
 		}
 		visited[token.Model] = true
-		route, err := g.catalog.Route(token.Model, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0, g.cfg.Anonymous)
+		route, err := g.routeForModel(token.Model, "")
 		if err != nil {
+			var oauthError *oauth.OAuthError
+			if errors.As(err, &oauthError) {
+				wire.WriteError(w, external, http.StatusServiceUnavailable, oauthError.Error(), "oauth_auth_error", ids.Request)
+				return
+			}
 			continue
 		}
 		counted := false
@@ -146,6 +156,14 @@ func (g *Gateway) handleRotation(w http.ResponseWriter, r *http.Request, externa
 				return
 			}
 			if result.err == nil {
+				return
+			}
+			var oauthError *oauth.OAuthError
+			if errors.As(result.err, &oauthError) {
+				wire.WriteError(w, external, http.StatusServiceUnavailable, oauthError.Error(), "oauth_auth_error", ids.Request)
+				return
+			}
+			if g.cfg.GoOAuth != nil && result.reason == "oauth_auth_error" {
 				return
 			}
 			if result.committed {
@@ -221,6 +239,8 @@ func (g *Gateway) rotationAttempt(parent context.Context, w http.ResponseWriter,
 	var shaped bool
 	if route.Anonymous {
 		resp, err, _ = g.doAnonymousUpstream(ctx, route, bodies, ids, attempt-1)
+	} else if connection := g.tierOAuth(route.Tier); connection != nil {
+		resp, err = g.oauthAttempt(ctx, route, bodies[route.Tier], ids, attempt, attempt-1, 0)
 	} else {
 		body, renames, keyShaped := g.shapeKeyBody(bodies[route.Tier], route, route.Tier, ids)
 		toolRenames, shaped = renames, keyShaped
@@ -278,9 +298,20 @@ func (g *Gateway) rotationAttempt(parent context.Context, w http.ResponseWriter,
 	}
 	if err != nil {
 		result.err = err
-		if errors.Is(err, errFirstEventTimeout) || ctx.Err() != nil {
+		var oauthError *oauth.OAuthError
+		if errors.As(err, &oauthError) {
+			result.reason = "oauth_auth_error"
+		} else if errors.Is(err, errFirstEventTimeout) || ctx.Err() != nil {
 			result.reason = "first_output_timeout"
 		}
+		return result
+	}
+	if g.tierOAuth(route.Tier) != nil && resp.StatusCode == http.StatusUnauthorized {
+		w.Header().Set("x-request-id", ids.Request)
+		g.copyErrorResponse(w, external, resp, ids.Request)
+		result.err = errors.New("Go OAuth authorization was rejected")
+		result.reason = "oauth_auth_error"
+		result.committed = true
 		return result
 	}
 	retryAfter := resp.Header.Get("Retry-After")

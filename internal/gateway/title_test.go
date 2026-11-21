@@ -53,7 +53,7 @@ func TestPrepareAnonymousBodyTitleTools(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			body, _ := prepareAnonymousBody([]byte(tc.body), wire.Chat, tc.v1, "ses_title")
+			body, _ := prepareAnonymousBody([]byte(tc.body), wire.Chat, tc.v1, "ses_title", nil)
 			var payload struct {
 				Tools []json.RawMessage `json:"tools"`
 			}

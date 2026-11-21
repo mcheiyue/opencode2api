@@ -185,9 +185,8 @@ func TestForwardStreamResumable_tornStreamResumesOnce(t *testing.T) {
 	if !strings.HasSuffix(out, doneFrame) {
 		t.Fatalf("output does not end with [DONE]: %q", out)
 	}
-	// The torn fragment must not be glued to the continuation's first frame.
-	if !strings.Contains(out, tornFragment+"\n\n") {
-		t.Fatalf("torn fragment was not terminated before the continuation: %q", out)
+	if strings.Contains(out, tornFragment) {
+		t.Fatalf("unterminated upstream frame was forwarded: %q", out)
 	}
 }
 
@@ -213,8 +212,11 @@ func TestForwardStreamResumable_tornTailTerminatedWhenNoTrailingNewline(t *testi
 				t.Fatalf("expected nil error after successful resume, got %v", err)
 			}
 			out := rec.Body.String()
-			if !strings.Contains(out, tc.fragment+tc.wantGap+"data: ") {
-				t.Fatalf("torn tail was not separated from the next segment (want %q after fragment): %q", tc.wantGap, out)
+			if strings.Contains(out, tc.fragment) {
+				t.Fatalf("unterminated upstream frame was forwarded: %q", out)
+			}
+			if !strings.Contains(out, `"content":" world"`) {
+				t.Fatalf("continuation content was not forwarded: %q", out)
 			}
 		})
 	}

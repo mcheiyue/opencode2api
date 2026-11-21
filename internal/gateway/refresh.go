@@ -174,8 +174,18 @@ func (g *Gateway) RefreshCatalog(ctx context.Context) {
 	var capabilitiesErr error
 	var wg sync.WaitGroup
 	wg.Add(3)
-	go func() { defer wg.Done(); zen = g.refreshZen(ctx) }()
-	go func() { defer wg.Done(); goModels = g.refreshTier(ctx, g.cfg.Upstream.Go, g.goNodes) }()
+	go func() {
+		defer wg.Done()
+		if g.cfg.ZenOAuth == nil {
+			zen = g.refreshZen(ctx)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if g.cfg.GoOAuth == nil {
+			goModels = g.refreshTier(ctx, g.cfg.Upstream.Go, g.goNodes)
+		}
+	}()
 	go func() {
 		defer wg.Done()
 		capabilityCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -189,8 +199,14 @@ func (g *Gateway) RefreshCatalog(ctx context.Context) {
 	if capabilitiesErr != nil {
 		g.logger.Warn("OpenCode capability catalog refresh failed", "component", "models", "event", "capability_refresh_failed", "error", capabilitiesErr)
 	}
+	if g.cfg.GoOAuth != nil {
+		goModels = g.seedOAuthCatalog(&capabilities, config.TierGo)
+	}
+	if g.cfg.ZenOAuth != nil {
+		zen = g.seedOAuthCatalog(&capabilities, config.TierZen)
+	}
 	if zen != nil || goModels != nil {
-		g.catalog.ReplaceWithCapabilities(zen, goModels, capabilities.Protocols, capabilities.Unsupported, capabilities.Metadata)
+		g.catalog.ReplaceWithCapabilities(zen, goModels, capabilities.Protocols, capabilities.Unsupported, capabilities.Metadata, g.oauthTiers()...)
 		g.syncRotation()
 		if ctx.Err() == nil {
 			if err := g.catalog.SaveCache(); err != nil {

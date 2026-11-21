@@ -3,7 +3,7 @@ import { api, setCsrf, clearCsrf, setUnauthorizedHandler } from "./api.js";
 import { refreshMonitor, loadConfig, loadDebugModels } from "./data.js";
 import * as i18n from "./i18n.js";
 import * as store from "./store.js";
-import { $, $$, toast } from "./ui.js";
+import { $, $$, closeDialogs, toast } from "./ui.js";
 import * as logstream from "./logstream.js";
 import { init as initTheme } from "./theme.js";
 
@@ -42,9 +42,11 @@ function openPage(id) {
   if (!page) return;
   current?.hide?.();
   history.replaceState(null, "", `#${id}`);
-  $$(".nav-item").forEach((button) =>
-    button.classList.toggle("active", button.dataset.page === id),
-  );
+  $$(".nav-item").forEach((button) => {
+    const active = button.dataset.page === id;
+    button.classList.toggle("active", active);
+    if (active) button.scrollIntoView({ block: "nearest", inline: "nearest" });
+  });
   $$(".page").forEach((node) => node.classList.toggle("hidden", node.id !== `page-${id}`));
   renderPageHeader(page);
   current = page;
@@ -53,6 +55,9 @@ function openPage(id) {
 
 function showLogin() {
   clearCsrf();
+  store.clear();
+  closeDialogs();
+  $$("input[type='password']").forEach((input) => (input.value = ""));
   current?.hide?.();
   current = null;
   $("#app").classList.add("hidden");

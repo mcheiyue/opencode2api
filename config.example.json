@@ -3,7 +3,8 @@
   "server_keys": ["change-this-local-key"],
   "zen_keys": [],
   "go_keys": [],
-  "anonymous": true,
+  // Anonymous traffic may be heavily blocked upstream. Prefer a Zen API Key.
+  "anonymous": false,
   "warp": {
     "enabled": false,
     "pool_size": 2,
@@ -15,7 +16,8 @@
   "upstream": {
     "zen": "https://opencode.ai/zen",
     "go": "https://opencode.ai/zen/go",
-    "anonymous": "https://opencode.ai/inference"
+    "anonymous": "https://opencode.ai/inference",
+    "prompt_environment": {}
   },
   "retry": {
     "max_attempts": 3,

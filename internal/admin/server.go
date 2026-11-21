@@ -18,6 +18,7 @@ import (
 	"opencode2api/internal/config"
 	"opencode2api/internal/gateway"
 	"opencode2api/internal/httpx"
+	"opencode2api/internal/oauth"
 	"opencode2api/internal/telemetry"
 	"opencode2api/webui"
 )
@@ -33,10 +34,15 @@ type Server struct {
 	mu            sync.Mutex
 	sessions      map[string]adminSession
 	attempts      map[string]loginWindow
+	loginChecks   int
 	debugAttempts map[string]loginWindow
 	lastInference *DebugInferenceResult
 	quotaMu       sync.Mutex
 	quotaCache    map[string]quotaCacheEntry
+	oauthMu       sync.Mutex
+	oauth         map[oauthKey]*oauthAttempt
+	oauthClient   *oauth.Client
+	proxyChecks   chan struct{}
 }
 
 // New returns a Server for manager, reporting to monitor and logs.
@@ -44,6 +50,8 @@ func New(manager *gateway.RuntimeController, monitor *telemetry.Metrics, logs *t
 	return &Server{
 		manager: manager, monitor: monitor, logs: logs, logger: logger, sessions: make(map[string]adminSession),
 		attempts: make(map[string]loginWindow), debugAttempts: make(map[string]loginWindow),
+		oauth: make(map[oauthKey]*oauthAttempt), oauthClient: oauth.NewClient(nil),
+		proxyChecks: make(chan struct{}, 8),
 	}
 }
 
@@ -61,6 +69,7 @@ func (a *Server) Handler() http.Handler {
 	mux.Handle("PUT /api/config", a.authenticate(a.csrf(http.HandlerFunc(a.handlePutConfig))))
 	mux.Handle("POST /api/config/reload", a.authenticate(a.csrf(http.HandlerFunc(a.handleReload))))
 	mux.Handle("POST /api/config/reveal", a.authenticate(a.csrf(http.HandlerFunc(a.handleReveal))))
+	mux.Handle("POST /api/proxies/check", a.authenticate(a.csrf(http.HandlerFunc(a.handleCheckProxy))))
 	mux.Handle("PUT /api/account", a.authenticate(a.csrf(http.HandlerFunc(a.handleAccount))))
 	mux.Handle("GET /api/monitor", a.authenticate(http.HandlerFunc(a.handleMonitor)))
 	mux.Handle("GET /api/debug/models", a.authenticate(http.HandlerFunc(a.handleDebugModels)))
@@ -72,6 +81,16 @@ func (a *Server) Handler() http.Handler {
 	mux.Handle("PUT /api/rotation", a.authenticate(a.csrf(http.HandlerFunc(a.handleSaveRotation))))
 	mux.Handle("POST /api/rotation/current", a.authenticate(a.csrf(http.HandlerFunc(a.handleSelectRotation))))
 	mux.Handle("GET /api/model-quotas", a.authenticate(http.HandlerFunc(a.handleModelQuotas)))
+	mux.Handle("GET /api/go/auth", a.authenticate(http.HandlerFunc(a.handleGoOAuthStatus)))
+	mux.Handle("POST /api/go/auth/start", a.authenticate(a.csrf(http.HandlerFunc(a.handleGoOAuthStart))))
+	mux.Handle("POST /api/go/auth/poll", a.authenticate(a.csrf(http.HandlerFunc(a.handleGoOAuthPoll))))
+	mux.Handle("DELETE /api/go/auth", a.authenticate(a.csrf(http.HandlerFunc(a.handleGoOAuthCancel))))
+	mux.Handle("DELETE /api/go/connection", a.authenticate(a.csrf(http.HandlerFunc(a.handleGoOAuthDisconnect))))
+	mux.Handle("GET /api/zen/auth", a.authenticate(http.HandlerFunc(a.handleZenOAuthStatus)))
+	mux.Handle("POST /api/zen/auth/start", a.authenticate(a.csrf(http.HandlerFunc(a.handleZenOAuthStart))))
+	mux.Handle("POST /api/zen/auth/poll", a.authenticate(a.csrf(http.HandlerFunc(a.handleZenOAuthPoll))))
+	mux.Handle("DELETE /api/zen/auth", a.authenticate(a.csrf(http.HandlerFunc(a.handleZenOAuthCancel))))
+	mux.Handle("DELETE /api/zen/connection", a.authenticate(a.csrf(http.HandlerFunc(a.handleZenOAuthDisconnect))))
 	mux.Handle("GET /api/api-keys", a.authenticate(http.HandlerFunc(a.handleListAPIKeys)))
 	mux.Handle("POST /api/api-keys", a.authenticate(a.csrf(http.HandlerFunc(a.handleCreateAPIKey))))
 	mux.Handle("PATCH /api/api-keys/{id}", a.authenticate(a.csrf(http.HandlerFunc(a.handleUpdateAPIKey))))
@@ -254,13 +273,50 @@ func (a *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	candidate := config.Config{
 		ServerKeyMetadata: current.ServerKeyMetadata,
 		Rotation:          current.Rotation,
+		GoOAuth:           current.GoOAuth,
+		ZenOAuth:          current.ZenOAuth,
 		Listen:            update.Listen, ServerKeys: serverKeys, ZenKeys: zenKeys, GoKeys: goKeys, Anonymous: update.Anonymous, Warp: update.Warp, Proxies: proxies, ProxyFile: update.ProxyFile,
 		ProxyBindings: proxyBindings,
 		Upstream:      update.Upstream, Retry: update.Retry, Models: update.Models, Performance: update.Performance, Logging: update.Logging, Prefer: update.Prefer,
 		Reasoning: reasoning,
 		WebUI:     config.WebUIConfig{Enabled: update.WebUI.Enabled, Listen: update.WebUI.Listen, Username: current.WebUI.Username, PasswordHash: current.WebUI.PasswordHash, SessionTTLMinutes: update.WebUI.SessionTTLMinutes},
 	}
-	result, err := a.manager.Apply(candidate, true)
+	result, err := a.manager.Update(func(latest *config.Config) error {
+		if !a.sessionValid(sessionID(r), *latest) {
+			return errors.New("management session is no longer active")
+		}
+		candidate.GoOAuth = latest.GoOAuth
+		candidate.ZenOAuth = latest.ZenOAuth
+		candidate.ServerKeyMetadata = latest.ServerKeyMetadata
+		candidate.Rotation = latest.Rotation
+		candidate.WebUI.Username = latest.WebUI.Username
+		candidate.WebUI.PasswordHash = latest.WebUI.PasswordHash
+		if update.Reasoning == nil {
+			candidate.Reasoning = latest.Reasoning
+		}
+		if update.ProxyBindings == nil {
+			candidate.ProxyBindings = latest.ProxyBindings
+		} else {
+			for key, proxy := range candidate.ProxyBindings {
+				if existing, ok := latest.ProxyBindings[key]; ok && proxy == config.RedactURL(existing) {
+					candidate.ProxyBindings[key] = existing
+				}
+			}
+		}
+		// A masked URL returned by GET must preserve its original userinfo
+		// when an operator edits unrelated settings.
+		if candidate.Upstream.Zen == config.RedactURL(latest.Upstream.Zen) {
+			candidate.Upstream.Zen = latest.Upstream.Zen
+		}
+		if candidate.Upstream.Go == config.RedactURL(latest.Upstream.Go) {
+			candidate.Upstream.Go = latest.Upstream.Go
+		}
+		if candidate.Upstream.Anonymous == config.RedactURL(latest.Upstream.Anonymous) {
+			candidate.Upstream.Anonymous = latest.Upstream.Anonymous
+		}
+		*latest = candidate
+		return nil
+	})
 	if err != nil {
 		a.logger.Warn("configuration update rejected", "component", "config", "event", "config_rejected", "error", err)
 		writeAdminError(w, http.StatusBadRequest, "configuration_rejected", err.Error())
@@ -336,6 +392,10 @@ func (a *Server) handleLogStream(w http.ResponseWriter, r *http.Request) {
 	if queryAfter, err := strconv.ParseUint(r.URL.Query().Get("after"), 10, 64); err == nil && queryAfter > after {
 		after = queryAfter
 	}
+	// Subscribe before taking the snapshot so an event published during replay
+	// is queued. The live loop skips events already included in the snapshot.
+	stream, unsubscribe := a.logs.Subscribe()
+	defer unsubscribe()
 	recent, gap := a.logs.Recent(after, 2000)
 	if gap {
 		_ = httpx.WriteSSE(w, "gap", 0, map[string]any{"message": "older log events have expired"})
@@ -347,8 +407,6 @@ func (a *Server) handleLogStream(w http.ResponseWriter, r *http.Request) {
 		after = event.Sequence
 	}
 	flusher.Flush()
-	stream, unsubscribe := a.logs.Subscribe()
-	defer unsubscribe()
 	cookie, _ := r.Cookie(adminCookieName)
 	keepAlive := time.NewTicker(20 * time.Second)
 	defer keepAlive.Stop()
@@ -357,6 +415,12 @@ func (a *Server) handleLogStream(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case event := <-stream:
+			if event.Sequence <= after {
+				continue
+			}
+			if cookie == nil || !a.sessionTokenValid(cookie.Value) {
+				return
+			}
 			if after > 0 && event.Sequence > after+1 {
 				_ = httpx.WriteSSE(w, "gap", 0, map[string]any{"message": "slow client missed log events", "after": after, "next": event.Sequence})
 			}
@@ -378,27 +442,24 @@ func (a *Server) handleLogStream(w http.ResponseWriter, r *http.Request) {
 // sessionTokenValid reports whether token still names a live session that
 // belongs to the current username and password hash.
 func (a *Server) sessionTokenValid(token string) bool {
-	a.mu.Lock()
-	session, ok := a.sessions[tokenDigest(token)]
-	if ok && time.Now().After(session.Expires) {
-		delete(a.sessions, tokenDigest(token))
-		ok = false
-	}
-	a.mu.Unlock()
-	if !ok {
-		return false
-	}
-	cfg := a.manager.Config()
-	return session.Username == cfg.WebUI.Username && session.AuthVersion == config.Fingerprint(cfg.WebUI.PasswordHash)
+	return a.sessionValid(tokenDigest(token), a.manager.Config())
 }
 
 // configView builds the masked view of the current configuration.
 func (a *Server) configView() ConfigView {
 	cfg := a.manager.Config()
 	effective, restart := a.manager.RestartStatus()
+	proxyBindings := make(map[string]string, len(cfg.ProxyBindings))
+	for key, proxy := range cfg.ProxyBindings {
+		proxyBindings[key] = config.RedactURL(proxy)
+	}
+	upstream := cfg.Upstream
+	upstream.Zen = config.RedactURL(upstream.Zen)
+	upstream.Go = config.RedactURL(upstream.Go)
+	upstream.Anonymous = config.RedactURL(upstream.Anonymous)
 	return ConfigView{
 		Listen: cfg.Listen, ServerKeys: maskSecrets(cfg.ServerKeys, false), ZenKeys: maskSecrets(cfg.ZenKeys, false), GoKeys: maskSecrets(cfg.GoKeys, false), Anonymous: cfg.Anonymous, Warp: cfg.Warp,
-		Proxies: maskSecrets(cfg.Proxies, true), ProxyFile: cfg.ProxyFile, ProxyBindings: cfg.ProxyBindings, Upstream: cfg.Upstream, Retry: cfg.Retry, Models: cfg.Models,
+		Proxies: maskSecrets(cfg.Proxies, true), ProxyFile: cfg.ProxyFile, ProxyBindings: proxyBindings, Upstream: upstream, Retry: cfg.Retry, Models: cfg.Models,
 		Performance: cfg.Performance, Logging: cfg.Logging, Prefer: cfg.Prefer, Reasoning: cfg.Reasoning,
 		WebUI:     WebUIView{Enabled: cfg.WebUI.Enabled, Listen: cfg.WebUI.Listen, Username: cfg.WebUI.Username, SessionTTLMinutes: cfg.WebUI.SessionTTLMinutes},
 		Effective: EffectiveView{Listen: effective.API, WebUIListen: effective.WebUI, WebUIEnabled: effective.WebUIEnabled},

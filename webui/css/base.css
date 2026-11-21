@@ -269,6 +269,22 @@ main {
 }
 
 @media (max-width: 680px) {
+  .nav {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 2px;
+    overflow: visible;
+  }
+
+  .nav-group {
+    display: contents;
+  }
+
+  .nav-item {
+    width: auto;
+    text-align: center;
+  }
+
   main {
     padding-inline: var(--sp-3);
   }

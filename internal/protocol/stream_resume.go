@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,6 +23,10 @@ func ForwardStreamResumable(ctx context.Context, w http.ResponseWriter, reader i
 	}
 	observer := streamUsageObserver(protocol)
 	observer.trackContent = resumer != nil
+	// Every segment goes through the tracker, so a frame reaches the client
+	// only after it parsed cleanly and stayed inside the size bound, and an
+	// upstream error frame never reaches it at all.
+	observer.relayValidatedFrames(w, flusher)
 	// Per-segment accounting: the continuation request replays the partial
 	// as prompt, so its reported Input would inflate the true first-segment
 	// cost and its Output alone would hide the delivered first-segment
@@ -33,9 +38,7 @@ func ForwardStreamResumable(ctx context.Context, w http.ResponseWriter, reader i
 	resumes := 0
 	toolArgsTried := false
 	for {
-		_, copyErr := io.Copy(&sseFlushWriter{writer: w, flusher: flusher}, io.TeeReader(reader, observer))
-		// Snapshot the torn tail before Finish clears the frame buffer.
-		tornTail := observer.Pending()
+		_, copyErr := io.Copy(observer, reader)
 		segUsage := observer.Finish()
 		if resumes == 0 {
 			total.Input = segUsage.Input
@@ -49,14 +52,14 @@ func ForwardStreamResumable(ctx context.Context, w http.ResponseWriter, reader i
 		if observer.ErrorTermination() {
 			reportResumeSkipped(resumer, "upstream_error_event", observer.visibleBytes, observer.reasoningBytes, observer.toolSeen)
 			closeCurrentIfNotFirst(reader, first)
-			if copyErr != nil {
+			if copyErr != nil && !errors.Is(copyErr, errStreamUpstreamFailure) {
 				return usage, observer.Reported(), copyErr
 			}
 			return usage, observer.Reported(), observer.UpstreamError()
 		}
 		if observer.NormalTermination() && observer.ParseError() == nil {
 			closeCurrentIfNotFirst(reader, first)
-			return usage, observer.Reported(), copyErr
+			return usage, observer.Reported(), nil
 		}
 		if ClientCanceled(ctx, copyErr) {
 			// A client that walked away must see no synthetic error and no
@@ -66,6 +69,11 @@ func ForwardStreamResumable(ctx context.Context, w http.ResponseWriter, reader i
 			if copyErr == nil {
 				copyErr = ctx.Err()
 			}
+			return usage, observer.Reported(), copyErr
+		}
+		var writeErr *ClientWriteError
+		if errors.As(copyErr, &writeErr) {
+			closeCurrentIfNotFirst(reader, first)
 			return usage, observer.Reported(), copyErr
 		}
 		// A tool call that arrived whole is missing only its terminal chunk,
@@ -95,12 +103,6 @@ func ForwardStreamResumable(ctx context.Context, w http.ResponseWriter, reader i
 					reportResumeSkipped(resumer, "tool_args_unrecoverable", observer.visibleBytes, observer.reasoningBytes, observer.toolSeen)
 				default:
 					request.Partial = partial
-					if terminator := missingRecordTerminator(tornTail); len(terminator) > 0 {
-						if _, err := w.Write(terminator); err != nil {
-							return usage, observer.Reported(), err
-						}
-						flusher.Flush()
-					}
 					next, err := resumeToolArgsWithPing(ctx, w, flusher, toolArgsResumer, request)
 					if err == nil {
 						closeCurrentIfNotFirst(reader, first)
@@ -127,16 +129,6 @@ func ForwardStreamResumable(ctx context.Context, w http.ResponseWriter, reader i
 					resumeObserver.ResumeEligible(observer.visibleBytes, observer.reasoningBytes, observer.toolSeen)
 				}
 				tail := observer.TailRunes(200)
-				if terminator := missingRecordTerminator(tornTail); len(terminator) > 0 {
-					// The dead stream stopped mid-frame and those bytes are
-					// already downstream; close the torn record now so neither
-					// the pings nor the continuation's first frame join it and
-					// get dropped by the client parser.
-					if _, err := w.Write(terminator); err != nil {
-						return usage, observer.Reported(), err
-					}
-					flusher.Flush()
-				}
 				next, resumeErr := resumeWithPing(ctx, w, flusher, resumer, observer.Text(), observer.Reasoning())
 				if resumeErr == nil {
 					closeCurrentIfNotFirst(reader, first)
@@ -179,6 +171,16 @@ func ForwardStreamResumable(ctx context.Context, w http.ResponseWriter, reader i
 		if cause == nil {
 			cause = errSSEUnexpectedEOF
 		}
+		// A client that never received a frame can still be told the attempt
+		// failed with a real status instead of a 200 stream holding an error
+		// event; once anything was written the response is committed and only
+		// an in-band error is left.
+		if !observer.Forwarded() {
+			w.Header().Del("X-Accel-Buffering")
+			WriteError(w, protocol, http.StatusBadGateway, "upstream SSE stream failed", "upstream_error", "")
+			closeCurrentIfNotFirst(reader, first)
+			return usage, observer.Reported(), cause
+		}
 		if resumerSilentClose(resumer) && emitSilentFinish(w, flusher, protocol, model, observer.ResponseID()) == nil {
 			closeCurrentIfNotFirst(reader, first)
 			return usage, observer.Reported(), fmt.Errorf("closed silently: %w", cause)
@@ -214,30 +216,6 @@ func resumerSilentClose(resumer StreamResumer) bool {
 func reportResumeSkipped(resumer StreamResumer, reason string, visibleBytes, reasoningBytes int, toolSeen bool) {
 	if observer, ok := resumer.(StreamResumeObserver); ok {
 		observer.ResumeSkipped(reason, visibleBytes, reasoningBytes, toolSeen)
-	}
-}
-
-// missingRecordTerminator returns the bytes needed to close an SSE record
-// left open by a torn frame: both newlines when it ended mid-line, the
-// missing one when it stopped after a single newline, nothing when the
-// record boundary is already complete.
-func missingRecordTerminator(tail []byte) []byte {
-	if len(tail) == 0 {
-		return nil
-	}
-	newlines := 0
-	for i := len(tail) - 1; i >= 0 && (tail[i] == '\n' || tail[i] == '\r'); i-- {
-		if tail[i] == '\n' {
-			newlines++
-		}
-	}
-	switch newlines {
-	case 0:
-		return []byte("\n\n")
-	case 1:
-		return []byte("\n")
-	default:
-		return nil
 	}
 }
 

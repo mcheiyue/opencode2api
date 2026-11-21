@@ -11,8 +11,10 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode"
 
 	"opencode2api/internal/jsonutil"
+	"opencode2api/internal/oauth"
 	wire "opencode2api/internal/protocol"
 	"opencode2api/internal/warp"
 )
@@ -32,6 +34,8 @@ type Config struct {
 	ServerKeyMetadata map[string]ServerKeyMetadata `json:"server_key_metadata,omitempty"`
 	ZenKeys           []string                     `json:"zen_keys"`
 	GoKeys            []string                     `json:"go_keys"`
+	GoOAuth           *oauth.Connection            `json:"go_oauth,omitempty"`
+	ZenOAuth          *oauth.Connection            `json:"zen_oauth,omitempty"`
 	Anonymous         bool                         `json:"anonymous"`
 	Warp              WarpConfig                   `json:"warp"`
 	Proxies           []string                     `json:"proxies"`
@@ -133,7 +137,44 @@ type UpstreamConfig struct {
 	// anonymous lane uses only this origin: the v1 /zen fallback is retired for
 	// free models and its call site is commented out. Empty means
 	// https://opencode.ai/inference.
-	Anonymous string `json:"anonymous"`
+	Anonymous         string                   `json:"anonymous"`
+	PromptEnvironment *PromptEnvironmentConfig `json:"prompt_environment,omitempty"`
+}
+
+type PromptEnvironmentConfig struct {
+	WorkingDirectory string `json:"working_directory,omitempty"`
+	WorkspaceRoot    string `json:"workspace_root,omitempty"`
+	Platform         string `json:"platform,omitempty"`
+	IsGitRepo        *bool  `json:"is_git_repo,omitempty"`
+}
+
+func (environment *PromptEnvironmentConfig) Normalize() error {
+	if environment == nil {
+		return nil
+	}
+	for name, value := range map[string]string{
+		"working_directory": environment.WorkingDirectory,
+		"workspace_root":    environment.WorkspaceRoot,
+	} {
+		for _, character := range value {
+			if unicode.IsControl(character) || character == '\u2028' || character == '\u2029' || character == '<' || character == '>' {
+				return fmt.Errorf("upstream.prompt_environment.%s must not contain control characters, line separators, or angle brackets", name)
+			}
+		}
+	}
+	platform := strings.ToLower(strings.TrimSpace(environment.Platform))
+	if platform == "windows" {
+		platform = "win32"
+	}
+	switch platform {
+	case "", "linux", "darwin", "win32":
+	default:
+		return errors.New("upstream.prompt_environment.platform must be linux, darwin, win32, windows, or empty")
+	}
+	environment.WorkingDirectory = strings.TrimSpace(environment.WorkingDirectory)
+	environment.WorkspaceRoot = strings.TrimSpace(environment.WorkspaceRoot)
+	environment.Platform = platform
+	return nil
 }
 
 // RetryConfig bounds the upstream retries. MaxAttempts caps the attempts of a
@@ -350,8 +391,13 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("parse %s: %w", path, err)
 	}
+	data, err = migrateOAuthFields(data)
+	if err != nil {
+		return Config{}, fmt.Errorf("parse %s: %w", path, err)
+	}
 	cfg := Config{
 		Listen:      "127.0.0.1:8080",
+		Anonymous:   false,
 		Warp:        WarpConfig{PoolSize: 2, Stack: string(warp.DefaultStack)},
 		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/zen", Go: "https://opencode.ai/zen/go", Anonymous: "https://opencode.ai/inference"},
 		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300, QuotaGateSeconds: 0, MaxRetryAfterSeconds: 60},
@@ -395,11 +441,52 @@ func Normalize(path string, cfg Config) (Config, error) {
 	if err := resolveProxyFiles(path, &cfg); err != nil {
 		return Config{}, err
 	}
+	for _, account := range []struct {
+		name       string
+		plan       oauth.Plan
+		connection **oauth.Connection
+	}{
+		{"go_oauth", oauth.PlanGo, &cfg.GoOAuth},
+		{"zen_oauth", oauth.PlanZen, &cfg.ZenOAuth},
+	} {
+		if *account.connection == nil {
+			continue
+		}
+		connection := cloneOAuth(*account.connection)
+		if err := connection.ValidateForPlan(account.plan); err != nil {
+			return Config{}, fmt.Errorf("%s contains an invalid credential or unsupported OAuth route", account.name)
+		}
+		connection.Proxy = strings.TrimSpace(connection.Proxy)
+		if connection.Proxy != "" {
+			matched := false
+			for _, proxy := range cfg.RuntimeProxies() {
+				if proxy == connection.Proxy {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return Config{}, fmt.Errorf("%s.proxy must name a configured proxy", account.name)
+			}
+		}
+		*account.connection = connection
+	}
 	if cfg.Prefer != TierZen && cfg.Prefer != TierGo {
 		return Config{}, errors.New("prefer must be \"zen\" or \"go\"")
 	}
 	if cfg.Listen == "" {
 		return Config{}, errors.New("listen must not be empty")
+	}
+	if cfg.Upstream.PromptEnvironment != nil {
+		environment := *cfg.Upstream.PromptEnvironment
+		if err := environment.Normalize(); err != nil {
+			return Config{}, err
+		}
+		if environment.IsGitRepo != nil {
+			isGitRepo := *environment.IsGitRepo
+			environment.IsGitRepo = &isGitRepo
+		}
+		cfg.Upstream.PromptEnvironment = &environment
 	}
 	cfg.Upstream.Zen = strings.TrimSpace(cfg.Upstream.Zen)
 	cfg.Upstream.Go = strings.TrimSpace(cfg.Upstream.Go)
@@ -419,8 +506,8 @@ func Normalize(path string, cfg Config) (Config, error) {
 	if cfg.FirstEnabledServerKey() == "" {
 		return Config{}, errors.New("at least one server key must remain enabled")
 	}
-	if !cfg.Anonymous && len(cfg.ZenKeys) == 0 && len(cfg.GoKeys) == 0 {
-		return Config{}, errors.New("zen_keys or go_keys must contain at least one upstream key unless anonymous is enabled")
+	if !cfg.Anonymous && len(cfg.ZenKeys) == 0 && len(cfg.GoKeys) == 0 && cfg.GoOAuth == nil && cfg.ZenOAuth == nil {
+		return Config{}, errors.New("configure a Zen API Key (zen_keys), a Go key (go_keys), or a saved Go/Zen OAuth connection; anonymous access is disabled by default and may be blocked upstream")
 	}
 	if cfg.Retry.MaxAttempts < 1 {
 		return Config{}, errors.New("retry.max_attempts must be at least 1")
@@ -484,18 +571,8 @@ func Normalize(path string, cfg Config) (Config, error) {
 		}
 	}
 	for _, raw := range cfg.RuntimeProxies() {
-		if raw == "direct" {
-			continue
-		}
-		clean, _ := ParseProxyEntry(raw)
-		u, err := url.Parse(clean)
-		if err != nil || u.Host == "" {
-			return Config{}, fmt.Errorf("invalid proxy URL %q", RedactURL(raw))
-		}
-		switch strings.ToLower(u.Scheme) {
-		case "http", "https", "socks5", "socks5h":
-		default:
-			return Config{}, fmt.Errorf("unsupported proxy scheme %q", u.Scheme)
+		if err := ValidateProxyEntry(raw); err != nil {
+			return Config{}, err
 		}
 	}
 	if err := cfg.Models.AnonymousBackoff.Normalize(); err != nil {
@@ -562,6 +639,9 @@ func normalizeReasoning(cfg *Config) error {
 		if err := validateEffort(fmt.Sprintf("reasoning.effort_by_model[%q]", key), level); err != nil {
 			return err
 		}
+		if existing, exists := normalized[key]; exists && existing != level {
+			return errors.New("reasoning.effort_by_model contains conflicting entries for the same model ID")
+		}
 		normalized[key] = level
 	}
 	cfg.Reasoning.EffortByModel = normalized
@@ -604,15 +684,6 @@ func (cfg Config) RuntimeProxies() []string {
 	return []string{"direct"}
 }
 
-// PasswordForSave clears the resolved proxy list (the proxies plus proxyfile
-// entries that RuntimeProxies returns), leaving only Config.Proxies; despite
-// its name it does not touch the WebUI password. SaveAtomic calls it on its
-// own copy before encoding. The field is unexported and so never encoded
-// anyway, which makes the call a guard rather than a requirement.
-func (cfg *Config) PasswordForSave() {
-	cfg.effectiveProxies = nil
-}
-
 // Clone returns a copy of cfg whose slices and maps, including the rotation
 // orders and the resolved proxy list, no longer share storage with cfg.
 func Clone(cfg Config) Config {
@@ -626,8 +697,18 @@ func Clone(cfg Config) Config {
 	cfg.ServerKeyMetadata = metadata
 	cfg.ZenKeys = append([]string(nil), cfg.ZenKeys...)
 	cfg.GoKeys = append([]string(nil), cfg.GoKeys...)
+	cfg.GoOAuth = cloneOAuth(cfg.GoOAuth)
+	cfg.ZenOAuth = cloneOAuth(cfg.ZenOAuth)
 	cfg.Proxies = append([]string(nil), cfg.Proxies...)
 	cfg.effectiveProxies = append([]string(nil), cfg.effectiveProxies...)
+	if cfg.Upstream.PromptEnvironment != nil {
+		environment := *cfg.Upstream.PromptEnvironment
+		if environment.IsGitRepo != nil {
+			isGitRepo := *environment.IsGitRepo
+			environment.IsGitRepo = &isGitRepo
+		}
+		cfg.Upstream.PromptEnvironment = &environment
+	}
 	if cfg.Models.Protocols != nil {
 		protocols := make(map[string]string, len(cfg.Models.Protocols))
 		for key, value := range cfg.Models.Protocols {
@@ -652,6 +733,18 @@ func Clone(cfg Config) Config {
 	return cfg
 }
 
+func cloneOAuth(source *oauth.Connection) *oauth.Connection {
+	if source == nil {
+		return nil
+	}
+	connection := *source
+	connection.Routes = make(map[string]oauth.Route, len(source.Routes))
+	for model, route := range source.Routes {
+		connection.Routes[model] = route
+	}
+	return &connection
+}
+
 // normalizeProxyBindings validates and canonicalizes explicit per-key proxy
 // bindings. Keys are mapped to their 16-hex fingerprint so secrets are never
 // stored twice, and target proxies must match a valid runtime proxy (or "direct").
@@ -665,24 +758,27 @@ func normalizeProxyBindings(cfg *Config) error {
 		return nil
 	}
 	keyMap := make(map[string]string, len(cfg.ZenKeys)+len(cfg.GoKeys))
-	for _, k := range cfg.ZenKeys {
-		fp := Fingerprint(k)
-		keyMap[k] = fp
-		keyMap[fp] = fp
+	for _, key := range cfg.ZenKeys {
+		fingerprint := Fingerprint(key)
+		keyMap[key] = fingerprint
+		keyMap[fingerprint] = fingerprint
 	}
-	for _, k := range cfg.GoKeys {
-		fp := Fingerprint(k)
-		keyMap[k] = fp
-		keyMap[fp] = fp
+	for _, key := range cfg.GoKeys {
+		fingerprint := Fingerprint(key)
+		keyMap[key] = fingerprint
+		keyMap[fingerprint] = fingerprint
 	}
 
 	knownProxies := make(map[string]string)
 	for _, raw := range cfg.RuntimeProxies() {
-		clean, _ := ParseProxyEntry(raw)
 		knownProxies[raw] = raw
-		knownProxies[clean] = raw
-		if clean == "direct" {
-			knownProxies["direct"] = "direct"
+	}
+	for _, raw := range cfg.RuntimeProxies() {
+		clean, _ := ParseProxyEntry(raw)
+		// An explicitly configured static route wins over the clean alias of
+		// a pool route that happens to dial the same endpoint.
+		if _, exists := knownProxies[clean]; !exists {
+			knownProxies[clean] = raw
 		}
 	}
 
@@ -690,7 +786,7 @@ func normalizeProxyBindings(cfg *Config) error {
 	for keyRef, proxyRef := range cfg.ProxyBindings {
 		trimmedKey := strings.TrimSpace(keyRef)
 		trimmedProxy := strings.TrimSpace(proxyRef)
-		fp, ok := keyMap[trimmedKey]
+		fingerprint, ok := keyMap[trimmedKey]
 		if !ok {
 			return fmt.Errorf("proxy_bindings contains reference to unknown key %q", MaskValue(trimmedKey))
 		}
@@ -698,7 +794,10 @@ func normalizeProxyBindings(cfg *Config) error {
 		if !ok {
 			return fmt.Errorf("proxy_bindings references unknown proxy %q", RedactURL(trimmedProxy))
 		}
-		normalized[fp] = canonicalProxy
+		if existing, exists := normalized[fingerprint]; exists && existing != canonicalProxy {
+			return errors.New("proxy_bindings contains conflicting entries for the same key")
+		}
+		normalized[fingerprint] = canonicalProxy
 	}
 	cfg.ProxyBindings = normalized
 	return nil
