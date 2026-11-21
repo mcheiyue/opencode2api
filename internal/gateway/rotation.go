@@ -242,7 +242,7 @@ func (g *Gateway) rotationAttempt(parent context.Context, w http.ResponseWriter,
 	} else if connection := g.tierOAuth(route.Tier); connection != nil {
 		resp, err = g.oauthAttempt(ctx, route, bodies[route.Tier], ids, attempt, attempt-1, 0)
 	} else {
-		body, renames, keyShaped := g.shapeKeyBody(bodies[route.Tier], route, route.Tier, ids)
+		body, renames, keyShaped := g.shapeKeyBody(ctx, bodies[route.Tier], route, route.Tier, ids)
 		toolRenames, shaped = renames, keyShaped
 		setRequestShape(parent, shaped, toolRenames)
 		pool, upstreamURL := g.zenNodes, g.cfg.Upstream.Zen

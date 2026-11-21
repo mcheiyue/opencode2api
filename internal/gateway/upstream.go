@@ -571,7 +571,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	preparedBodies := make([][]byte, len(upstreams))
 	toolRenames := make([]*wire.ToolRenames, len(upstreams))
 	for i, baseURL := range upstreams {
-		preparedBodies[i], toolRenames[i] = prepareAnonymousBody(rawBody, protocol, models.IsV1Upstream(baseURL), v2RootSession(ids), g.cfg.Upstream.PromptEnvironment)
+		preparedBodies[i], toolRenames[i] = prepareAnonymousBody(rawBody, protocol, models.IsV1Upstream(baseURL), v2RootSession(ids), g.requestEnvironment(ctx))
 	}
 	for proxies < limit {
 		if ctx.Err() != nil {
@@ -1000,7 +1000,7 @@ func (g *Gateway) dumpOutboundBodies(route models.Route, bodies map[config.Tier]
 // shaped body, the tool renames to restore in the response, and whether the
 // body changed so the gateway can collapse the SSE stream a non-streaming
 // client receives back.
-func (g *Gateway) shapeKeyBody(body []byte, route models.Route, tier config.Tier, ids identity.RequestIDs) ([]byte, *wire.ToolRenames, bool) {
+func (g *Gateway) shapeKeyBody(ctx context.Context, body []byte, route models.Route, tier config.Tier, ids identity.RequestIDs) ([]byte, *wire.ToolRenames, bool) {
 	if !g.catalog.IsFreeModel(route.ID) {
 		return body, nil, false
 	}
@@ -1008,7 +1008,7 @@ func (g *Gateway) shapeKeyBody(body []byte, route models.Route, tier config.Tier
 	if tier == config.TierGo {
 		baseURL = g.cfg.Upstream.Go
 	}
-	shaped, renames := prepareAnonymousBody(body, route.ProtocolFor(tier), models.IsV1Upstream(baseURL), v2RootSession(ids), g.cfg.Upstream.PromptEnvironment)
+	shaped, renames := prepareAnonymousBody(body, route.ProtocolFor(tier), models.IsV1Upstream(baseURL), v2RootSession(ids), g.requestEnvironment(ctx))
 	return shaped, renames, !bytes.Equal(shaped, body)
 }
 
@@ -1040,7 +1040,7 @@ func (g *Gateway) doSelectedKeyUpstream(ctx context.Context, route models.Route,
 	if len(body) == 0 {
 		return nil, fmt.Errorf("no prepared %s request body", override.Tier), 0
 	}
-	shaped, toolRenames, changed := g.shapeKeyBody(body, route, override.Tier, ids)
+	shaped, toolRenames, changed := g.shapeKeyBody(ctx, body, route, override.Tier, ids)
 	if changed {
 		body = shaped
 	}
@@ -1132,7 +1132,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 	if len(body) == 0 {
 		return nil, fmt.Errorf("no prepared %s request body", route.Tier), 0
 	}
-	shaped, toolRenames, changed := g.shapeKeyBody(body, route, route.Tier, ids)
+	shaped, toolRenames, changed := g.shapeKeyBody(ctx, body, route, route.Tier, ids)
 	if changed {
 		body = shaped
 	}
